@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="relinkmain.cpp" />
+    <ClCompile Include="Aup2Parser.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Aup2Parser.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="version.rc" />
+  </ItemGroup>
+</Project>
