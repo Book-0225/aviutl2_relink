@@ -5,12 +5,14 @@
 #include <commdlg.h>
 #include <filesystem>
 #include <format>
+#include <optional>
+#include <shobjidl.h>
 #include <stdexcept>
 #include <shellapi.h>
 #include <string>
 #include <vector>
 
-constexpr wchar_t APP_TITLE[] = L"aviutl2_relink v0.0.1";
+constexpr wchar_t APP_TITLE_BASE[] = L"aviutl2_relink v0.0.2";
 
 constexpr int32_t ID_BTN_OPEN = 101;
 constexpr int32_t ID_EDIT_FILEPATH = 102;
@@ -18,6 +20,7 @@ constexpr int32_t ID_LIST = 103;
 constexpr int32_t ID_BTN_CHECK = 104;
 constexpr int32_t ID_BTN_EDITSEL = 105;
 constexpr int32_t ID_BTN_SAVE = 106;
+constexpr int32_t ID_BTN_REPLACEROOT = 107;
 constexpr int32_t COL_STATUS = 0;
 constexpr int32_t COL_KEY = 1;
 constexpr int32_t COL_PATH = 2;
@@ -26,6 +29,7 @@ static HWND g_hWnd = nullptr;
 static HWND g_hList = nullptr;
 static Aup2Document g_doc;
 static bool g_loaded = false;
+static bool g_dirty = false;
 static std::vector<CheckResult> g_checkResults;
 
 static std::wstring ToWide(const std::string &s) {
@@ -87,6 +91,125 @@ static HMENU ControlId(int32_t id) {
   return reinterpret_cast<HMENU>(static_cast<INT_PTR>(id));
 }
 
+static void UpdateWindowTitle() {
+  std::wstring title = APP_TITLE_BASE;
+  if (g_loaded) {
+    title += L" - ";
+    title += g_doc.sourcePath.filename().wstring();
+  }
+  if (g_dirty)
+    title += L" *";
+  SetWindowText(g_hWnd, title.c_str());
+}
+
+static void UpdateControlStates() {
+  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_CHECK), g_loaded);
+  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_EDITSEL), g_loaded);
+  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_REPLACEROOT), g_loaded);
+  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_SAVE), g_loaded && g_dirty);
+}
+
+static void SetDirty(bool dirty) {
+  g_dirty = dirty;
+  UpdateWindowTitle();
+  UpdateControlStates();
+}
+
+static std::wstring EnsureTrailingSeparator(std::wstring path) {
+  if (path.empty())
+    return path;
+  if (path.back() != L'\\' && path.back() != L'/')
+    path.push_back(L'\\');
+  return path;
+}
+
+static bool StartsWithPathPrefix(const std::wstring &value,
+                                 const std::wstring &prefix) {
+  if (value.size() < prefix.size())
+    return false;
+  return CompareStringOrdinal(value.c_str(), static_cast<int32_t>(prefix.size()),
+                              prefix.c_str(), static_cast<int32_t>(prefix.size()),
+                              TRUE) == CSTR_EQUAL;
+}
+
+static std::optional<std::filesystem::path>
+PickFolder(const std::wstring &title,
+           const std::filesystem::path &initialFolder = {}) {
+  IFileDialog *dialog = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+  if (FAILED(hr))
+    return std::nullopt;
+
+  DWORD options = 0;
+  hr = dialog->GetOptions(&options);
+  if (SUCCEEDED(hr)) {
+    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM |
+                       FOS_PATHMUSTEXIST);
+  }
+  dialog->SetTitle(title.c_str());
+
+  if (!initialFolder.empty()) {
+    IShellItem *folderItem = nullptr;
+    hr = SHCreateItemFromParsingName(initialFolder.c_str(), nullptr,
+                                     IID_PPV_ARGS(&folderItem));
+    if (SUCCEEDED(hr)) {
+      dialog->SetFolder(folderItem);
+      folderItem->Release();
+    }
+  }
+
+  hr = dialog->Show(g_hWnd);
+  if (FAILED(hr)) {
+    dialog->Release();
+    return std::nullopt;
+  }
+
+  IShellItem *resultItem = nullptr;
+  hr = dialog->GetResult(&resultItem);
+  dialog->Release();
+  if (FAILED(hr))
+    return std::nullopt;
+
+  PWSTR displayName = nullptr;
+  hr = resultItem->GetDisplayName(SIGDN_FILESYSPATH, &displayName);
+  resultItem->Release();
+  if (FAILED(hr))
+    return std::nullopt;
+
+  std::filesystem::path selected(displayName);
+  CoTaskMemFree(displayName);
+  return selected;
+}
+
+static bool SaveCurrentDocument() {
+  if (!g_loaded)
+    return true;
+  if (!SaveAup2(g_doc, g_doc.sourcePath)) {
+    MessageBox(g_hWnd, L"保存に失敗しました。", L"エラー", MB_ICONERROR);
+    return false;
+  }
+
+  SetDirty(false);
+  MessageBox(g_hWnd, L"保存しました。(バックアップ: .aup2.bak)", L"完了",
+             MB_ICONINFORMATION);
+  return true;
+}
+
+static bool ConfirmSaveIfDirty() {
+  if (!g_loaded || !g_dirty)
+    return true;
+
+  int32_t result =
+      MessageBox(g_hWnd, L"未保存の変更があります。保存しますか？", L"確認",
+                 MB_YESNOCANCEL | MB_ICONWARNING);
+  if (result == IDCANCEL)
+    return false;
+  if (result == IDYES)
+    return SaveCurrentDocument();
+  return true;
+}
+
 static void ListViewPopulate() {
   ListView_DeleteAllItems(g_hList);
 
@@ -130,6 +253,7 @@ static void OpenFile(const std::filesystem::path &path) {
   g_doc = std::move(*result);
   g_loaded = true;
   g_checkResults.clear();
+  SetDirty(false);
 
   SetWindowText(GetDlgItem(g_hWnd, ID_EDIT_FILEPATH), g_doc.sourcePath.c_str());
 
@@ -151,9 +275,14 @@ static void OpenFile(const std::filesystem::path &path) {
   }
 
   ListViewPopulate();
+  UpdateWindowTitle();
+  UpdateControlStates();
 }
 
 static void OnBtnOpen() {
+  if (!ConfirmSaveIfDirty())
+    return;
+
   std::vector<WCHAR> buf(32768, L'\0');
   OPENFILENAME ofn{};
   ofn.lStructSize = sizeof(ofn);
@@ -222,6 +351,9 @@ static void OnBtnEditSel() {
                             MB_YESNO | MB_ICONQUESTION) == IDYES);
   }
 
+  if (newPath == oldPath)
+    return;
+
   selEntry.path = newPath;
 
   if (updateAll) {
@@ -231,7 +363,73 @@ static void OnBtnEditSel() {
   }
 
   g_checkResults.clear();
+  SetDirty(true);
   ListViewPopulate();
+}
+
+static void OnBtnReplaceRoot() {
+  if (!g_loaded)
+    return;
+
+  std::filesystem::path suggestedRoot;
+  int32_t sel = ListView_GetNextItem(g_hList, -1, LVNI_SELECTED);
+  if (sel >= 0 && sel < static_cast<int32_t>(g_doc.entries.size())) {
+    suggestedRoot = PathFromUtf8(g_doc.entries[sel].path).parent_path();
+  } else if (!g_doc.entries.empty()) {
+    suggestedRoot = PathFromUtf8(g_doc.entries.front().path).parent_path();
+  }
+
+  auto oldRoot = PickFolder(L"置換元フォルダを選択してください", suggestedRoot);
+  if (!oldRoot)
+    return;
+
+  auto newRoot = PickFolder(L"置換先フォルダを選択してください", *oldRoot);
+  if (!newRoot)
+    return;
+
+  auto normalizedOld = NormalizePathForCompare(*oldRoot);
+  auto normalizedNew = NormalizePathForCompare(*newRoot);
+  std::wstring oldRootText = normalizedOld.wstring();
+  std::wstring newRootText = normalizedNew.wstring();
+  std::wstring oldPrefix = EnsureTrailingSeparator(oldRootText);
+  std::wstring newPrefix = EnsureTrailingSeparator(newRootText);
+
+  int32_t updated = 0;
+  for (auto &entry : g_doc.entries) {
+    if (entry.isProjectFile)
+      continue;
+
+    std::wstring current = NormalizePathForCompare(PathFromUtf8(entry.path)).wstring();
+    std::wstring replaced;
+    if (PathsReferToSameLocation(current, oldRootText)) {
+      replaced = newRootText;
+    } else if (StartsWithPathPrefix(current, oldPrefix)) {
+      replaced = newPrefix + current.substr(oldPrefix.size());
+    } else {
+      continue;
+    }
+
+    std::string newPath = ToUtf8(replaced);
+    if (entry.path == newPath)
+      continue;
+
+    entry.path = std::move(newPath);
+    ++updated;
+  }
+
+  if (updated == 0) {
+    MessageBox(g_hWnd, L"指定した置換元に一致する参照パスはありませんでした。",
+               L"ルート一括置換", MB_ICONINFORMATION);
+    return;
+  }
+
+  g_checkResults.clear();
+  SetDirty(true);
+  ListViewPopulate();
+
+  std::wstring msg =
+      std::format(L"{} 件の参照パスを置換しました。", updated);
+  MessageBox(g_hWnd, msg.c_str(), L"ルート一括置換", MB_ICONINFORMATION);
 }
 
 static void OnBtnCheck() {
@@ -256,15 +454,15 @@ static void OnBtnCheck() {
 static void OnBtnSave() {
   if (!g_loaded)
     return;
-  if (!SaveAup2(g_doc, g_doc.sourcePath)) {
-    MessageBox(g_hWnd, L"保存に失敗しました。", L"エラー", MB_ICONERROR);
-    return;
-  }
-  MessageBox(g_hWnd, L"保存しました。(バックアップ: .aup2.bak)", L"完了",
-             MB_ICONINFORMATION);
+  SaveCurrentDocument();
 }
 
 static void OnDropFiles(HDROP hDrop) {
+  if (!ConfirmSaveIfDirty()) {
+    DragFinish(hDrop);
+    return;
+  }
+
   UINT length = DragQueryFile(hDrop, 0, nullptr, 0);
   if (length > 0) {
     std::vector<WCHAR> buf(length + 1, L'\0');
@@ -277,6 +475,7 @@ static void OnDropFiles(HDROP hDrop) {
 static void OnSize(int32_t cx, int32_t cy) {
   constexpr int32_t MARGIN = 8;
   constexpr int32_t BTN_W = 72;
+  constexpr int32_t MID_BTN_W = 120;
   constexpr int32_t BTN_H = 24;
   constexpr int32_t ROW_H = 32;
   constexpr int32_t BOTTOM = 36;
@@ -293,8 +492,10 @@ static void OnSize(int32_t cx, int32_t cy) {
   y += listH + 4;
 
   MoveWindow(GetDlgItem(g_hWnd, ID_BTN_CHECK), MARGIN, y, BTN_W, BTN_H, TRUE);
-  MoveWindow(GetDlgItem(g_hWnd, ID_BTN_EDITSEL), MARGIN + BTN_W + 4, y, 120,
+  MoveWindow(GetDlgItem(g_hWnd, ID_BTN_EDITSEL), MARGIN + BTN_W + 4, y, MID_BTN_W,
              BTN_H, TRUE);
+  MoveWindow(GetDlgItem(g_hWnd, ID_BTN_REPLACEROOT),
+             MARGIN + BTN_W + 4 + MID_BTN_W + 4, y, MID_BTN_W, BTN_H, TRUE);
   MoveWindow(GetDlgItem(g_hWnd, ID_BTN_SAVE), cx - MARGIN - BTN_W, y, BTN_W,
              BTN_H, TRUE);
 }
@@ -343,8 +544,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
                    ControlId(ID_BTN_EDITSEL), hi, nullptr);
       CreateWindow(L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0,
                    0, 0, 0, hWnd, ControlId(ID_BTN_SAVE), hi, nullptr);
+      CreateWindow(L"BUTTON", L"ルート一括置換",
+                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
+                   ControlId(ID_BTN_REPLACEROOT), hi, nullptr);
 
       DragAcceptFiles(hWnd, TRUE);
+      UpdateWindowTitle();
+      UpdateControlStates();
       return 0;
     }
 
@@ -366,7 +572,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
       case ID_BTN_SAVE:
         OnBtnSave();
         break;
+      case ID_BTN_REPLACEROOT:
+        OnBtnReplaceRoot();
+        break;
       }
+      return 0;
+
+    case WM_CLOSE:
+      if (!ConfirmSaveIfDirty())
+        return 0;
+      DestroyWindow(hWnd);
       return 0;
 
     case WM_DROPFILES:
@@ -390,6 +605,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
 
 int32_t WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine,
                     int32_t nCmdShow) {
+  CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
   INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES};
   InitCommonControlsEx(&icc);
 
@@ -402,7 +619,7 @@ int32_t WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine,
   wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
   RegisterClass(&wc);
 
-  HWND hWnd = CreateWindow(L"aviutl2_relink", APP_TITLE,
+  HWND hWnd = CreateWindow(L"aviutl2_relink", APP_TITLE_BASE,
                            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                            900, 600, nullptr, nullptr, hInstance, nullptr);
 
@@ -421,5 +638,6 @@ int32_t WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine,
     TranslateMessage(&msg);
     DispatchMessage(&msg);
   }
+  CoUninitialize();
   return static_cast<int32_t>(msg.wParam);
 }
