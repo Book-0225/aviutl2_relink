@@ -9,8 +9,11 @@ std::filesystem::path PathFromUtf8(const std::string &utf8) {
 }
 
 static bool IsAbsolutePath(const std::string &value) {
-  return value.size() >= 3 && std::isalpha((unsigned char)value[0]) &&
-         value[1] == ':' && value[2] == '\\';
+  try {
+    return PathFromUtf8(value).is_absolute();
+  } catch (...) {
+    return false;
+  }
 }
 
 static std::string TrimRight(const std::string &s) {

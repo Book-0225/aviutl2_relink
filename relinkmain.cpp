@@ -5,6 +5,7 @@
 #include <commdlg.h>
 #include <filesystem>
 #include <format>
+#include <stdexcept>
 #include <shellapi.h>
 #include <string>
 #include <vector>
@@ -30,20 +31,60 @@ static std::vector<CheckResult> g_checkResults;
 static std::wstring ToWide(const std::string &s) {
   if (s.empty())
     return {};
-  int32_t n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-  std::wstring w(n - 1, L'\0');
-  MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+
+  int32_t n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(),
+                                  static_cast<int32_t>(s.size()), nullptr, 0);
+  if (n <= 0)
+    throw std::runtime_error("Failed to convert UTF-8 string to UTF-16.");
+
+  std::wstring w(n, L'\0');
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(),
+                          static_cast<int32_t>(s.size()), w.data(), n) != n) {
+    throw std::runtime_error("Failed to convert UTF-8 string to UTF-16.");
+  }
   return w;
 }
 
 static std::string ToUtf8(const std::wstring &w) {
   if (w.empty())
     return {};
-  int32_t n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr,
-                              nullptr);
-  std::string s(n - 1, '\0');
-  WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, s.data(), n, nullptr, nullptr);
+
+  int32_t n =
+      WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int32_t>(w.size()),
+                          nullptr, 0, nullptr, nullptr);
+  if (n <= 0)
+    throw std::runtime_error("Failed to convert UTF-16 string to UTF-8.");
+
+  std::string s(n, '\0');
+  if (WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int32_t>(w.size()),
+                          s.data(), n, nullptr, nullptr) != n) {
+    throw std::runtime_error("Failed to convert UTF-16 string to UTF-8.");
+  }
   return s;
+}
+
+static std::filesystem::path NormalizePathForCompare(
+    const std::filesystem::path &path) {
+  std::error_code ec;
+  auto normalized = path.lexically_normal();
+
+  auto weak = std::filesystem::weakly_canonical(normalized, ec);
+  if (!ec)
+    normalized = weak;
+
+  return normalized;
+}
+
+static bool PathsReferToSameLocation(const std::filesystem::path &lhs,
+                                     const std::filesystem::path &rhs) {
+  auto left = NormalizePathForCompare(lhs).wstring();
+  auto right = NormalizePathForCompare(rhs).wstring();
+  return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) ==
+         CSTR_EQUAL;
+}
+
+static HMENU ControlId(int32_t id) {
+  return reinterpret_cast<HMENU>(static_cast<INT_PTR>(id));
 }
 
 static void ListViewPopulate() {
@@ -95,7 +136,7 @@ static void OpenFile(const std::filesystem::path &path) {
   for (auto &entry : g_doc.entries) {
     if (!entry.isProjectFile)
       continue;
-    if (PathFromUtf8(entry.path) != g_doc.sourcePath) {
+    if (!PathsReferToSameLocation(PathFromUtf8(entry.path), g_doc.sourcePath)) {
       std::wstring msg =
           std::wstring(L"プロジェクトの記録パスと実際のパスが異なります。\n\n"
                        L"  記録: ") +
@@ -113,17 +154,17 @@ static void OpenFile(const std::filesystem::path &path) {
 }
 
 static void OnBtnOpen() {
-  WCHAR buf[MAX_PATH]{};
+  std::vector<WCHAR> buf(32768, L'\0');
   OPENFILENAME ofn{};
   ofn.lStructSize = sizeof(ofn);
   ofn.hwndOwner = g_hWnd;
   ofn.lpstrFilter = L"AviUtl2 Project (*.aup2)\0*.aup2\0All Files (*.*)\0*.*\0";
-  ofn.lpstrFile = buf;
-  ofn.nMaxFile = MAX_PATH;
-  ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+  ofn.lpstrFile = buf.data();
+  ofn.nMaxFile = static_cast<DWORD>(buf.size());
+  ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
   if (!GetOpenFileName(&ofn))
     return;
-  OpenFile(buf);
+  OpenFile(buf.data());
 }
 
 static void OnBtnEditSel() {
@@ -139,20 +180,26 @@ static void OnBtnEditSel() {
   auto &selEntry = g_doc.entries[sel];
   const std::string oldPath = selEntry.path;
 
-  WCHAR buf[MAX_PATH]{};
-  wcscpy_s(buf, ToWide(oldPath).c_str());
+  std::vector<WCHAR> buf(32768, L'\0');
+  std::wstring initialPath = ToWide(oldPath);
+  if (initialPath.size() >= buf.size()) {
+    MessageBox(g_hWnd, L"初期パスが長すぎるため開けません。", L"エラー",
+               MB_ICONERROR);
+    return;
+  }
+  wcscpy_s(buf.data(), buf.size(), initialPath.c_str());
 
   OPENFILENAME ofn{};
   ofn.lStructSize = sizeof(ofn);
   ofn.hwndOwner = g_hWnd;
   ofn.lpstrFilter = L"All Files (*.*)\0*.*\0";
-  ofn.lpstrFile = buf;
-  ofn.nMaxFile = MAX_PATH;
-  ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+  ofn.lpstrFile = buf.data();
+  ofn.nMaxFile = static_cast<DWORD>(buf.size());
+  ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
   if (!GetOpenFileName(&ofn))
     return;
 
-  const std::string newPath = ToUtf8(buf);
+  const std::string newPath = ToUtf8(buf.data());
 
   std::vector<size_t> sameIndices;
   for (size_t i = 0; i < g_doc.entries.size(); ++i) {
@@ -218,9 +265,12 @@ static void OnBtnSave() {
 }
 
 static void OnDropFiles(HDROP hDrop) {
-  WCHAR buf[MAX_PATH]{};
-  if (DragQueryFile(hDrop, 0, buf, MAX_PATH))
-    OpenFile(buf);
+  UINT length = DragQueryFile(hDrop, 0, nullptr, 0);
+  if (length > 0) {
+    std::vector<WCHAR> buf(length + 1, L'\0');
+    if (DragQueryFile(hDrop, 0, buf.data(), length + 1))
+      OpenFile(buf.data());
+  }
   DragFinish(hDrop);
 }
 
@@ -257,18 +307,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
       HINSTANCE hi = reinterpret_cast<CREATESTRUCT *>(lp)->hInstance;
 
       CreateWindow(L"BUTTON", L"開く", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0,
-                   0, 0, 0, hWnd, reinterpret_cast<HMENU>(ID_BTN_OPEN), hi,
-                   nullptr);
+                   0, 0, 0, hWnd, ControlId(ID_BTN_OPEN), hi, nullptr);
       CreateWindow(L"EDIT", L"",
                    WS_CHILD | WS_VISIBLE | WS_BORDER | ES_READONLY |
                        ES_AUTOHSCROLL,
-                   0, 0, 0, 0, hWnd, reinterpret_cast<HMENU>(ID_EDIT_FILEPATH),
-                   hi, nullptr);
+                   0, 0, 0, 0, hWnd, ControlId(ID_EDIT_FILEPATH), hi, nullptr);
 
       g_hList = CreateWindow(
           WC_LISTVIEW, L"",
           WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SHOWSELALWAYS, 0,
-          0, 0, 0, hWnd, reinterpret_cast<HMENU>(ID_LIST), hi, nullptr);
+          0, 0, 0, hWnd, ControlId(ID_LIST), hi, nullptr);
       ListView_SetExtendedListViewStyle(g_hList, LVS_EX_FULLROWSELECT |
                                                      LVS_EX_GRIDLINES);
 
@@ -289,13 +337,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
 
       CreateWindow(L"BUTTON", L"チェック",
                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
-                   reinterpret_cast<HMENU>(ID_BTN_CHECK), hi, nullptr);
+                   ControlId(ID_BTN_CHECK), hi, nullptr);
       CreateWindow(L"BUTTON", L"選択行を変更",
                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
-                   reinterpret_cast<HMENU>(ID_BTN_EDITSEL), hi, nullptr);
+                   ControlId(ID_BTN_EDITSEL), hi, nullptr);
       CreateWindow(L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0,
-                   0, 0, 0, hWnd, reinterpret_cast<HMENU>(ID_BTN_SAVE), hi,
-                   nullptr);
+                   0, 0, 0, hWnd, ControlId(ID_BTN_SAVE), hi, nullptr);
 
       DragAcceptFiles(hWnd, TRUE);
       return 0;
