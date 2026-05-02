@@ -3,16 +3,24 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <algorithm>
+#include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <map>
+#include <memory>
 #include <optional>
 #include <shobjidl.h>
 #include <stdexcept>
 #include <shellapi.h>
 #include <string>
+#include <thread>
 #include <vector>
 
-constexpr wchar_t APP_TITLE_BASE[] = L"aviutl2_relink v0.0.2";
+constexpr wchar_t APP_TITLE_BASE[] = L"aviutl2_relink v0.0.3";
+constexpr wchar_t COPY_RULES_FILE[] = L"aviutl2_relink.copy.ini";
 
 constexpr int32_t ID_BTN_OPEN = 101;
 constexpr int32_t ID_EDIT_FILEPATH = 102;
@@ -21,15 +29,81 @@ constexpr int32_t ID_BTN_CHECK = 104;
 constexpr int32_t ID_BTN_EDITSEL = 105;
 constexpr int32_t ID_BTN_SAVE = 106;
 constexpr int32_t ID_BTN_REPLACEROOT = 107;
+constexpr int32_t ID_BTN_COPYFILES = 108;
+constexpr int32_t ID_BTN_CHECKEXPORT = 109;
 constexpr int32_t COL_STATUS = 0;
 constexpr int32_t COL_KEY = 1;
 constexpr int32_t COL_PATH = 2;
+constexpr uint32_t WM_COPYFILES_DONE = WM_APP + 1;
+
+enum class CopyAction { Copy, Skip, Ask };
+enum class PreserveTreeMode { Flat, Drive, CommonRoot };
+enum class UpdatePathsMode { Ask, Yes, No };
+enum class OverwriteMode { Ask, Yes, No };
+
+struct CopyRule {
+  CopyAction action = CopyAction::Ask;
+  std::wstring pattern;
+  std::wstring reason;
+};
+
+struct CopySettings {
+  CopyAction defaultAction = CopyAction::Ask;
+  PreserveTreeMode preserveTree = PreserveTreeMode::Drive;
+  UpdatePathsMode updatePathsAfterCopy = UpdatePathsMode::Ask;
+  OverwriteMode overwrite = OverwriteMode::Ask;
+  UpdatePathsMode exportLog = UpdatePathsMode::Ask;
+  UpdatePathsMode exportResult = UpdatePathsMode::Ask;
+  UpdatePathsMode saveAfterUpdate = UpdatePathsMode::Ask;
+  std::wstring projectSideFolder = L"{project_name}_files";
+  std::vector<CopyRule> rules;
+};
+
+struct CopyCandidate {
+  std::filesystem::path source;
+  CopyAction action = CopyAction::Ask;
+  std::wstring reason;
+  bool exists = false;
+};
+
+struct CopyPlanItem {
+  std::filesystem::path source;
+  std::filesystem::path dest;
+  CopyAction action = CopyAction::Ask;
+  std::wstring reason;
+  std::wstring result;
+  std::wstring detail;
+  bool exists = false;
+  bool destExists = false;
+};
+
+struct CopyPlan {
+  std::filesystem::path destRoot;
+  std::vector<CopyPlanItem> items;
+};
+
+struct CopyExecutionResult {
+  std::filesystem::path destRoot;
+  std::vector<CopyPlanItem> records;
+  std::map<std::wstring, std::filesystem::path> copiedPaths;
+  int32_t copied = 0;
+  int32_t skippedExisting = 0;
+  int32_t failed = 0;
+  int32_t missing = 0;
+  int32_t excluded = 0;
+  int32_t skippedAsk = 0;
+  bool updatePaths = false;
+  UpdatePathsMode exportLog = UpdatePathsMode::No;
+  UpdatePathsMode exportResult = UpdatePathsMode::No;
+  UpdatePathsMode saveAfterUpdate = UpdatePathsMode::No;
+};
 
 static HWND g_hWnd = nullptr;
 static HWND g_hList = nullptr;
 static Aup2Document g_doc;
 static bool g_loaded = false;
 static bool g_dirty = false;
+static bool g_copyInProgress = false;
 static std::vector<CheckResult> g_checkResults;
 
 static std::wstring ToWide(const std::string &s) {
@@ -97,16 +171,22 @@ static void UpdateWindowTitle() {
     title += L" - ";
     title += g_doc.sourcePath.filename().wstring();
   }
+  if (g_copyInProgress)
+    title += L" - コピー中";
   if (g_dirty)
     title += L" *";
   SetWindowText(g_hWnd, title.c_str());
 }
 
 static void UpdateControlStates() {
-  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_CHECK), g_loaded);
-  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_EDITSEL), g_loaded);
-  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_REPLACEROOT), g_loaded);
-  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_SAVE), g_loaded && g_dirty);
+  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_OPEN), !g_copyInProgress);
+  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_CHECK), g_loaded && !g_copyInProgress);
+  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_CHECKEXPORT),
+               g_loaded && !g_copyInProgress);
+  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_EDITSEL), g_loaded && !g_copyInProgress);
+  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_REPLACEROOT), g_loaded && !g_copyInProgress);
+  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_COPYFILES), g_loaded && !g_copyInProgress);
+  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_SAVE), g_loaded && g_dirty && !g_copyInProgress);
 }
 
 static void SetDirty(bool dirty) {
@@ -130,6 +210,617 @@ static bool StartsWithPathPrefix(const std::wstring &value,
   return CompareStringOrdinal(value.c_str(), static_cast<int32_t>(prefix.size()),
                               prefix.c_str(), static_cast<int32_t>(prefix.size()),
                               TRUE) == CSTR_EQUAL;
+}
+
+static std::wstring Trim(const std::wstring &s) {
+  size_t first = s.find_first_not_of(L" \t\r\n");
+  if (first == std::wstring::npos)
+    return {};
+  size_t last = s.find_last_not_of(L" \t\r\n");
+  return s.substr(first, last - first + 1);
+}
+
+static std::wstring ToLower(std::wstring s) {
+  std::transform(s.begin(), s.end(), s.begin(),
+                 [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+  return s;
+}
+
+static std::wstring NormalizeSlashes(std::wstring s) {
+  std::replace(s.begin(), s.end(), L'\\', L'/');
+  return s;
+}
+
+static bool EqualsIgnoreCase(const std::wstring &lhs,
+                             const std::wstring &rhs) {
+  return CompareStringOrdinal(lhs.c_str(), -1, rhs.c_str(), -1, TRUE) ==
+         CSTR_EQUAL;
+}
+
+static std::optional<CopyAction> ParseCopyAction(const std::wstring &value) {
+  auto v = ToLower(Trim(value));
+  if (v == L"copy")
+    return CopyAction::Copy;
+  if (v == L"skip")
+    return CopyAction::Skip;
+  if (v == L"ask")
+    return CopyAction::Ask;
+  return std::nullopt;
+}
+
+static std::optional<PreserveTreeMode>
+ParsePreserveTreeMode(const std::wstring &value) {
+  auto v = ToLower(Trim(value));
+  if (v == L"flat")
+    return PreserveTreeMode::Flat;
+  if (v == L"drive")
+    return PreserveTreeMode::Drive;
+  if (v == L"common_root")
+    return PreserveTreeMode::CommonRoot;
+  return std::nullopt;
+}
+
+static std::optional<UpdatePathsMode>
+ParseUpdatePathsMode(const std::wstring &value) {
+  auto v = ToLower(Trim(value));
+  if (v == L"ask")
+    return UpdatePathsMode::Ask;
+  if (v == L"yes" || v == L"true" || v == L"1")
+    return UpdatePathsMode::Yes;
+  if (v == L"no" || v == L"false" || v == L"0")
+    return UpdatePathsMode::No;
+  return std::nullopt;
+}
+
+static std::optional<OverwriteMode> ParseOverwriteMode(const std::wstring &value) {
+  auto v = ToLower(Trim(value));
+  if (v == L"ask")
+    return OverwriteMode::Ask;
+  if (v == L"yes" || v == L"true" || v == L"1")
+    return OverwriteMode::Yes;
+  if (v == L"no" || v == L"false" || v == L"0")
+    return OverwriteMode::No;
+  return std::nullopt;
+}
+
+static bool WildcardMatch(const wchar_t *pattern, const wchar_t *text) {
+  while (*pattern) {
+    if (*pattern == L'*') {
+      int32_t starCount = 0;
+      while (*pattern == L'*') {
+        ++starCount;
+        ++pattern;
+      }
+
+      bool crossDirectories = starCount >= 2;
+      if (!*pattern) {
+        if (crossDirectories)
+          return true;
+        while (*text) {
+          if (*text == L'/')
+            return false;
+          ++text;
+        }
+        return true;
+      }
+
+      const wchar_t *scan = text;
+      for (;;) {
+        if (WildcardMatch(pattern, scan))
+          return true;
+        if (!*scan || (!crossDirectories && *scan == L'/'))
+          return false;
+        ++scan;
+      }
+    }
+
+    if (!*text)
+      return false;
+
+    if (*pattern == L'?') {
+      if (*text == L'/')
+        return false;
+    } else if (towlower(*pattern) != towlower(*text)) {
+      return false;
+    }
+
+    ++pattern;
+    ++text;
+  }
+
+  return *text == L'\0';
+}
+
+static bool PatternMatchesPath(const std::wstring &pattern,
+                               const std::filesystem::path &path) {
+  std::wstring normalizedPattern = NormalizeSlashes(Trim(pattern));
+  if (normalizedPattern.empty())
+    return false;
+
+  std::wstring full = NormalizeSlashes(path.lexically_normal().wstring());
+  std::wstring filename = NormalizeSlashes(path.filename().wstring());
+  bool pathPattern = normalizedPattern.find(L'/') != std::wstring::npos ||
+                     normalizedPattern.find(L':') != std::wstring::npos;
+
+  const std::wstring &target = pathPattern ? full : filename;
+  return WildcardMatch(normalizedPattern.c_str(), target.c_str());
+}
+
+static std::filesystem::path GetExeDirectory() {
+  std::vector<wchar_t> buf(MAX_PATH);
+  for (;;) {
+    DWORD n = GetModuleFileName(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+    if (n == 0)
+      return std::filesystem::current_path();
+    if (n < buf.size() - 1)
+      return std::filesystem::path(buf.data()).parent_path();
+    buf.resize(buf.size() * 2);
+  }
+}
+
+static std::wstring ExpandProjectFolderTemplate(std::wstring value) {
+  std::wstring projectName = g_doc.sourcePath.stem().wstring();
+  size_t pos = 0;
+  while ((pos = value.find(L"{project_name}", pos)) != std::wstring::npos) {
+    value.replace(pos, 14, projectName);
+    pos += projectName.size();
+  }
+  return value;
+}
+
+static bool WriteDefaultCopyRules(const std::filesystem::path &path) {
+  std::ofstream ofs(path, std::ios::binary);
+  if (!ofs)
+    return false;
+
+  ofs << "# aviutl2_relink copy rules\n"
+         "# Lines are evaluated from top to bottom. Actions: copy, skip, ask.\n"
+         "# Pattern without a slash matches file name. Pattern with slash matches full path.\n"
+         "\n"
+         "default_action=ask\n"
+         "preserve_tree=drive\n"
+         "project_side_folder={project_name}_files\n"
+         "update_paths_after_copy=ask\n"
+         "overwrite=ask\n"
+         "export_log=ask\n"
+         "export_result=ask\n"
+         "save_after_update=ask\n"
+         "\n"
+         "skip=*.dll|binary/plugin\n"
+         "skip=*.exe|executable\n"
+         "skip=*.bat|script\n"
+         "skip=*.cmd|script\n"
+         "skip=*.ps1|script\n"
+         "skip=*.auf|AviUtl plugin\n"
+         "skip=*.aui|AviUtl plugin\n"
+         "skip=*.auo|AviUtl plugin\n"
+         "skip=*.auf2|AviUtl2 plugin\n"
+         "skip=*.aui2|AviUtl2 plugin\n"
+         "skip=*.auo2|AviUtl2 plugin\n"
+         "skip=*.aux2|AviUtl2 plugin\n"
+         "skip=C:/Program Files/**|installed application/plugin area\n"
+         "skip=C:/Program Files (x86)/**|installed application/plugin area\n"
+         "\n"
+         "ask=*.lua|script\n"
+         "ask=*.js|script\n"
+         "ask=*.vbs|script\n"
+         "ask=*.json|settings or data\n"
+         "ask=*.ini|settings\n"
+         "ask=*.cfg|settings\n"
+         "ask=*.ttf|font\n"
+         "ask=*.otf|font\n"
+         "\n"
+         "copy=*.mp4\n"
+         "copy=*.mov\n"
+         "copy=*.avi\n"
+         "copy=*.mkv\n"
+         "copy=*.webm\n"
+         "copy=*.wav\n"
+         "copy=*.mp3\n"
+         "copy=*.flac\n"
+         "copy=*.ogg\n"
+         "copy=*.m4a\n"
+         "copy=*.png\n"
+         "copy=*.jpg\n"
+         "copy=*.jpeg\n"
+         "copy=*.webp\n"
+         "copy=*.bmp\n"
+         "copy=*.gif\n"
+         "copy=*.tif\n"
+         "copy=*.tiff\n"
+         "copy=*.psd\n"
+         "copy=*.txt\n"
+         "copy=*.srt\n"
+         "copy=*.ass\n";
+  return ofs.good();
+}
+
+static CopySettings LoadCopySettings() {
+  CopySettings settings;
+  auto configPath = GetExeDirectory() / COPY_RULES_FILE;
+
+  if (!std::filesystem::exists(configPath)) {
+    if (WriteDefaultCopyRules(configPath)) {
+      std::wstring msg =
+          std::wstring(COPY_RULES_FILE) +
+          L" を作成しました。\n必要に応じて編集できます。";
+      MessageBox(g_hWnd, msg.c_str(), L"コピー設定", MB_ICONINFORMATION);
+    }
+  }
+
+  std::ifstream ifs(configPath, std::ios::binary);
+  if (!ifs)
+    return settings;
+
+  std::string lineUtf8;
+  while (std::getline(ifs, lineUtf8)) {
+    std::wstring line;
+    try {
+      line = ToWide(lineUtf8);
+    } catch (...) {
+      continue;
+    }
+    line = Trim(line);
+    if (line.empty() || line.front() == L'#' || line.front() == L';')
+      continue;
+
+    size_t eq = line.find(L'=');
+    if (eq == std::wstring::npos)
+      continue;
+
+    std::wstring key = ToLower(Trim(line.substr(0, eq)));
+    std::wstring value = Trim(line.substr(eq + 1));
+
+    if (key == L"default_action") {
+      if (auto parsed = ParseCopyAction(value))
+        settings.defaultAction = *parsed;
+    } else if (key == L"preserve_tree") {
+      if (auto parsed = ParsePreserveTreeMode(value))
+        settings.preserveTree = *parsed;
+    } else if (key == L"project_side_folder") {
+      if (!value.empty())
+        settings.projectSideFolder = value;
+    } else if (key == L"update_paths_after_copy") {
+      if (auto parsed = ParseUpdatePathsMode(value))
+        settings.updatePathsAfterCopy = *parsed;
+    } else if (key == L"overwrite") {
+      if (auto parsed = ParseOverwriteMode(value))
+        settings.overwrite = *parsed;
+    } else if (key == L"export_log") {
+      if (auto parsed = ParseUpdatePathsMode(value))
+        settings.exportLog = *parsed;
+    } else if (key == L"export_result") {
+      if (auto parsed = ParseUpdatePathsMode(value))
+        settings.exportResult = *parsed;
+    } else if (key == L"save_after_update") {
+      if (auto parsed = ParseUpdatePathsMode(value))
+        settings.saveAfterUpdate = *parsed;
+    } else if (key == L"copy" || key == L"skip" || key == L"ask") {
+      CopyRule rule;
+      rule.action = *ParseCopyAction(key);
+      size_t pipe = value.find(L'|');
+      rule.pattern = Trim(value.substr(0, pipe));
+      if (pipe != std::wstring::npos)
+        rule.reason = Trim(value.substr(pipe + 1));
+      if (!rule.pattern.empty())
+        settings.rules.push_back(std::move(rule));
+    }
+  }
+
+  return settings;
+}
+
+static CopyCandidate ClassifyCopyCandidate(const std::filesystem::path &source,
+                                           const CopySettings &settings) {
+  CopyCandidate candidate;
+  candidate.source = source;
+  candidate.action = settings.defaultAction;
+
+  std::error_code ec;
+  candidate.exists = std::filesystem::is_regular_file(source, ec);
+  if (ec)
+    candidate.exists = false;
+
+  for (const auto &rule : settings.rules) {
+    if (!PatternMatchesPath(rule.pattern, source))
+      continue;
+    candidate.action = rule.action;
+    candidate.reason = rule.reason;
+    break;
+  }
+
+  return candidate;
+}
+
+static std::wstring SanitizePathPart(std::wstring value) {
+  for (auto &ch : value) {
+    if (ch == L':' || ch == L'<' || ch == L'>' || ch == L'"' || ch == L'|' ||
+        ch == L'?' || ch == L'*')
+      ch = L'_';
+  }
+  return value;
+}
+
+static std::filesystem::path RelativePathForCopy(
+    const std::filesystem::path &source, PreserveTreeMode mode,
+    const std::filesystem::path &commonRoot) {
+  if (mode == PreserveTreeMode::Flat)
+    return source.filename();
+
+  if (mode == PreserveTreeMode::CommonRoot && !commonRoot.empty()) {
+    std::error_code ec;
+    auto rel = std::filesystem::relative(source, commonRoot, ec);
+    if (!ec && !rel.empty() && rel.native().find(L"..") != 0)
+      return rel;
+  }
+
+  std::filesystem::path result;
+  std::wstring root = source.root_name().wstring();
+  if (!root.empty())
+    result /= SanitizePathPart(root);
+
+  auto relative = source.relative_path();
+  if (!relative.empty())
+    result /= relative;
+  else
+    result /= source.filename();
+
+  return result;
+}
+
+static std::filesystem::path ComputeCommonRoot(
+    const std::vector<CopyCandidate> &candidates) {
+  std::filesystem::path common;
+  for (const auto &candidate : candidates) {
+    if (!candidate.exists || candidate.action == CopyAction::Skip)
+      continue;
+
+    auto parent = candidate.source.parent_path();
+    if (common.empty()) {
+      common = parent;
+      continue;
+    }
+
+    std::vector<std::filesystem::path> left;
+    std::vector<std::filesystem::path> right;
+    for (const auto &part : common)
+      left.push_back(part);
+    for (const auto &part : parent)
+      right.push_back(part);
+
+    std::filesystem::path next;
+    size_t count = (std::min)(left.size(), right.size());
+    for (size_t i = 0; i < count; ++i) {
+      if (!EqualsIgnoreCase(left[i].wstring(), right[i].wstring()))
+        break;
+      next /= left[i];
+    }
+    common = next;
+  }
+  return common;
+}
+
+static std::vector<CopyCandidate> BuildCopyCandidates(
+    const CopySettings &settings) {
+  std::vector<CopyCandidate> candidates;
+  std::vector<std::wstring> seen;
+
+  for (const auto &entry : g_doc.entries) {
+    if (entry.isProjectFile)
+      continue;
+
+    std::filesystem::path source = NormalizePathForCompare(PathFromUtf8(entry.path));
+    std::wstring sourceText = source.wstring();
+    bool duplicate = false;
+    for (const auto &item : seen) {
+      if (EqualsIgnoreCase(item, sourceText)) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (duplicate)
+      continue;
+
+    seen.push_back(sourceText);
+    candidates.push_back(ClassifyCopyCandidate(source, settings));
+  }
+
+  return candidates;
+}
+
+static CopyPlan BuildCopyPlan(const CopySettings &settings,
+                              const std::filesystem::path &destRoot) {
+  CopyPlan plan;
+  plan.destRoot = destRoot;
+  auto candidates = BuildCopyCandidates(settings);
+  auto commonRoot = ComputeCommonRoot(candidates);
+
+  std::map<std::wstring, int32_t> destCounts;
+  for (const auto &candidate : candidates) {
+    CopyPlanItem item;
+    item.source = candidate.source;
+    item.action = candidate.action;
+    item.reason = candidate.reason;
+    item.exists = candidate.exists;
+
+    auto relative =
+        RelativePathForCopy(candidate.source, settings.preserveTree, commonRoot);
+    item.dest = destRoot / relative;
+
+    std::wstring destKey = ToLower(item.dest.lexically_normal().wstring());
+    int32_t &count = destCounts[destKey];
+    if (count > 0) {
+      auto parent = item.dest.parent_path();
+      auto stem = item.dest.stem().wstring();
+      auto ext = item.dest.extension().wstring();
+      item.dest = parent / std::format(L"{} ({}){}", stem, count + 1, ext);
+    }
+    ++count;
+
+    std::error_code ec;
+    item.destExists = std::filesystem::exists(item.dest, ec);
+    plan.items.push_back(std::move(item));
+  }
+
+  return plan;
+}
+
+static std::wstring DescribeFirstItems(const CopyPlan &plan, CopyAction action,
+                                       int32_t maxItems) {
+  std::wstring text;
+  int32_t count = 0;
+  for (const auto &item : plan.items) {
+    if (item.action != action)
+      continue;
+    if (count >= maxItems)
+      break;
+    text += L"\n  ";
+    text += item.source.filename().wstring();
+    if (!item.reason.empty()) {
+      text += L" (";
+      text += item.reason;
+      text += L")";
+    }
+    ++count;
+  }
+  return text;
+}
+
+static std::wstring CopyActionName(CopyAction action) {
+  switch (action) {
+  case CopyAction::Copy:
+    return L"copy";
+  case CopyAction::Skip:
+    return L"skip";
+  case CopyAction::Ask:
+    return L"ask";
+  }
+  return L"unknown";
+}
+
+static bool ResolveAskSetting(UpdatePathsMode mode, const std::wstring &message,
+                              const std::wstring &title) {
+  if (mode == UpdatePathsMode::Yes)
+    return true;
+  if (mode == UpdatePathsMode::No)
+    return false;
+  return MessageBox(g_hWnd, message.c_str(), title.c_str(),
+                    MB_YESNO | MB_ICONQUESTION) == IDYES;
+}
+
+static std::wstring MakeTimestamp() {
+  auto now = std::chrono::system_clock::now();
+  std::time_t t = std::chrono::system_clock::to_time_t(now);
+  std::tm local{};
+  localtime_s(&local, &t);
+  return std::format(L"{:04}{:02}{:02}_{:02}{:02}{:02}",
+                     local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
+                     local.tm_hour, local.tm_min, local.tm_sec);
+}
+
+static std::string CsvCell(const std::wstring &value) {
+  std::string utf8 = ToUtf8(value);
+  bool quote = utf8.find_first_of(",\"\r\n") != std::string::npos;
+  if (!quote)
+    return utf8;
+
+  std::string out = "\"";
+  for (char ch : utf8) {
+    if (ch == '"')
+      out += "\"\"";
+    else
+      out += ch;
+  }
+  out += "\"";
+  return out;
+}
+
+static bool WriteTextUtf8(const std::filesystem::path &path,
+                          const std::wstring &text) {
+  std::ofstream ofs(path, std::ios::binary);
+  if (!ofs)
+    return false;
+  ofs << "\xEF\xBB\xBF";
+  ofs << ToUtf8(text);
+  return ofs.good();
+}
+
+static bool WriteCopyLog(const CopyExecutionResult &result,
+                         const std::filesystem::path &path,
+                         int32_t updated, bool saved) {
+  std::wstring text;
+  text += L"aviutl2_relink copy log\n";
+  text += L"timestamp: " + MakeTimestamp() + L"\n";
+  text += L"project: " + g_doc.sourcePath.wstring() + L"\n";
+  text += L"destination: " + result.destRoot.wstring() + L"\n\n";
+  text += std::format(L"copied: {}\nexisting skipped: {}\nfailed: {}\n"
+                      L"missing: {}\nexcluded: {}\nask skipped: {}\n"
+                      L"path updated: {}\nauto saved: {}\n\n",
+                      result.copied, result.skippedExisting, result.failed,
+                      result.missing, result.excluded, result.skippedAsk,
+                      updated, saved ? L"yes" : L"no");
+
+  for (const auto &item : result.records) {
+    text += L"[";
+    text += item.result;
+    text += L"] ";
+    text += item.source.wstring();
+    if (!item.dest.empty()) {
+      text += L" -> ";
+      text += item.dest.wstring();
+    }
+    text += L" action=" + CopyActionName(item.action);
+    if (!item.reason.empty())
+      text += L" reason=" + item.reason;
+    if (!item.detail.empty())
+      text += L" detail=" + item.detail;
+    text += L"\n";
+  }
+
+  return WriteTextUtf8(path, text);
+}
+
+static bool WriteCopyResultCsv(const CopyExecutionResult &result,
+                               const std::filesystem::path &path) {
+  std::ofstream ofs(path, std::ios::binary);
+  if (!ofs)
+    return false;
+
+  ofs << "\xEF\xBB\xBF";
+  ofs << "result,action,source,destination,reason,detail\r\n";
+  for (const auto &item : result.records) {
+    ofs << CsvCell(item.result) << ','
+        << CsvCell(CopyActionName(item.action)) << ','
+        << CsvCell(item.source.wstring()) << ','
+        << CsvCell(item.dest.wstring()) << ','
+        << CsvCell(item.reason) << ','
+        << CsvCell(item.detail) << "\r\n";
+  }
+  return ofs.good();
+}
+
+static bool WriteCheckResultCsv(const Aup2Document &doc,
+                                const std::vector<CheckResult> &results,
+                                const std::filesystem::path &path) {
+  std::ofstream ofs(path, std::ios::binary);
+  if (!ofs)
+    return false;
+
+  ofs << "\xEF\xBB\xBF";
+  ofs << "status,key,path,is_project_file,project\r\n";
+  for (size_t i = 0; i < doc.entries.size(); ++i) {
+    const auto &entry = doc.entries[i];
+    bool exists = false;
+    if (i < results.size())
+      exists = results[i].exists;
+
+    ofs << CsvCell(exists ? L"OK" : L"NG") << ','
+        << CsvCell(ToWide(entry.key)) << ','
+        << CsvCell(ToWide(entry.path)) << ','
+        << CsvCell(entry.isProjectFile ? L"yes" : L"no") << ','
+        << CsvCell(doc.sourcePath.wstring()) << "\r\n";
+  }
+  return ofs.good();
 }
 
 static std::optional<std::filesystem::path>
@@ -180,6 +871,33 @@ PickFolder(const std::wstring &title,
   std::filesystem::path selected(displayName);
   CoTaskMemFree(displayName);
   return selected;
+}
+
+static std::optional<std::filesystem::path>
+PickSavePath(const std::wstring &title, const std::wstring &filter,
+             const std::filesystem::path &initialFolder,
+             const std::wstring &defaultFileName,
+             const wchar_t *defaultExt) {
+  std::vector<WCHAR> buf(32768, L'\0');
+  if (defaultFileName.size() >= buf.size())
+    return std::nullopt;
+  wcscpy_s(buf.data(), buf.size(), defaultFileName.c_str());
+
+  OPENFILENAME ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = g_hWnd;
+  ofn.lpstrFilter = filter.c_str();
+  ofn.lpstrFile = buf.data();
+  ofn.nMaxFile = static_cast<DWORD>(buf.size());
+  ofn.lpstrDefExt = defaultExt;
+  std::wstring initialFolderText = initialFolder.wstring();
+  if (!initialFolderText.empty())
+    ofn.lpstrInitialDir = initialFolderText.c_str();
+  ofn.lpstrTitle = title.c_str();
+  ofn.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+  if (!GetSaveFileName(&ofn))
+    return std::nullopt;
+  return std::filesystem::path(buf.data());
 }
 
 static bool SaveCurrentDocument() {
@@ -432,6 +1150,313 @@ static void OnBtnReplaceRoot() {
   MessageBox(g_hWnd, msg.c_str(), L"ルート一括置換", MB_ICONINFORMATION);
 }
 
+static void StartCopyWorker(CopyPlan plan, bool copyAskItems,
+                            bool overwriteExisting, bool updatePaths,
+                            UpdatePathsMode exportLog,
+                            UpdatePathsMode exportResult,
+                            UpdatePathsMode saveAfterUpdate) {
+  g_copyInProgress = true;
+  UpdateWindowTitle();
+  UpdateControlStates();
+  SetCursor(LoadCursor(nullptr, IDC_WAIT));
+
+  std::thread([plan = std::move(plan), copyAskItems, overwriteExisting,
+               updatePaths, exportLog, exportResult, saveAfterUpdate]() mutable {
+    auto *result = new CopyExecutionResult;
+    result->destRoot = plan.destRoot;
+    result->updatePaths = updatePaths;
+    result->exportLog = exportLog;
+    result->exportResult = exportResult;
+    result->saveAfterUpdate = saveAfterUpdate;
+
+    for (const auto &item : plan.items) {
+      CopyPlanItem record = item;
+      if (!item.exists) {
+        record.result = L"missing";
+        record.detail = L"source file not found";
+        ++result->missing;
+        result->records.push_back(std::move(record));
+        continue;
+      }
+      if (item.action == CopyAction::Skip) {
+        record.result = L"excluded";
+        record.detail = L"skipped by rule";
+        ++result->excluded;
+        result->records.push_back(std::move(record));
+        continue;
+      }
+      if (item.action == CopyAction::Ask && !copyAskItems) {
+        record.result = L"ask_skipped";
+        record.detail = L"ask items were not included";
+        ++result->skippedAsk;
+        result->records.push_back(std::move(record));
+        continue;
+      }
+      if (item.destExists && !overwriteExisting) {
+        record.result = L"existing_skipped";
+        record.detail = L"destination already exists";
+        ++result->skippedExisting;
+        result->records.push_back(std::move(record));
+        continue;
+      }
+
+      std::error_code ec;
+      std::filesystem::create_directories(item.dest.parent_path(), ec);
+      if (ec) {
+        record.result = L"failed";
+        record.detail = L"failed to create destination folder";
+        ++result->failed;
+        result->records.push_back(std::move(record));
+        continue;
+      }
+
+      auto options = overwriteExisting
+                         ? std::filesystem::copy_options::overwrite_existing
+                         : std::filesystem::copy_options::none;
+      std::filesystem::copy_file(item.source, item.dest, options, ec);
+      if (ec) {
+        record.result = L"failed";
+        record.detail = L"failed to copy file";
+        ++result->failed;
+        result->records.push_back(std::move(record));
+        continue;
+      }
+
+      record.result = L"copied";
+      record.detail = item.destExists ? L"overwritten" : L"";
+      ++result->copied;
+      result->copiedPaths[ToLower(NormalizePathForCompare(item.source).wstring())] =
+          NormalizePathForCompare(item.dest);
+      result->records.push_back(std::move(record));
+    }
+
+    if (!PostMessage(g_hWnd, WM_COPYFILES_DONE, 0,
+                     reinterpret_cast<LPARAM>(result))) {
+      delete result;
+    }
+  }).detach();
+}
+
+static void FinishCopyFiles(CopyExecutionResult &result) {
+  g_copyInProgress = false;
+  SetCursor(LoadCursor(nullptr, IDC_ARROW));
+
+  int32_t updated = 0;
+  if (result.updatePaths && !result.copiedPaths.empty()) {
+    for (auto &entry : g_doc.entries) {
+      if (entry.isProjectFile)
+        continue;
+      auto sourceKey =
+          ToLower(NormalizePathForCompare(PathFromUtf8(entry.path)).wstring());
+      auto it = result.copiedPaths.find(sourceKey);
+      if (it == result.copiedPaths.end())
+        continue;
+      std::string newPath = ToUtf8(it->second.wstring());
+      if (entry.path == newPath)
+        continue;
+      entry.path = std::move(newPath);
+      ++updated;
+    }
+  }
+
+  bool saveRequested = false;
+  bool saved = false;
+  if (updated > 0) {
+    g_checkResults.clear();
+    SetDirty(true);
+    ListViewPopulate();
+    saveRequested = ResolveAskSetting(result.saveAfterUpdate,
+                                      L"コピー先へ参照パスを変更しました。\n"
+                                      L"このままプロジェクトを保存しますか？",
+                                      L"素材コピー");
+    if (saveRequested) {
+      saved = SaveCurrentDocument();
+    }
+  } else {
+    UpdateWindowTitle();
+    UpdateControlStates();
+  }
+
+  bool logRequested = false;
+  bool logExported = false;
+  bool resultRequested = false;
+  bool resultExported = false;
+  std::vector<std::filesystem::path> exportedPaths;
+  std::error_code ec;
+  std::filesystem::create_directories(result.destRoot, ec);
+  std::wstring baseName = g_doc.sourcePath.stem().wstring() + L"_copy_" + MakeTimestamp();
+
+  logRequested = ResolveAskSetting(result.exportLog,
+                                   L"コピー処理のログを .log で出力しますか？",
+                                   L"素材コピー");
+  if (logRequested) {
+    auto logPath = result.destRoot / (baseName + L".log");
+    logExported = WriteCopyLog(result, logPath, updated, saved);
+    if (logExported)
+      exportedPaths.push_back(logPath);
+  }
+
+  resultRequested = ResolveAskSetting(result.exportResult,
+                                      L"コピー結果を .csv で出力しますか？",
+                                      L"素材コピー");
+  if (resultRequested) {
+    auto csvPath = result.destRoot / (baseName + L".csv");
+    resultExported = WriteCopyResultCsv(result, csvPath);
+    if (resultExported)
+      exportedPaths.push_back(csvPath);
+  }
+
+  std::wstring resultMsg =
+      std::format(L"コピー完了: {} 件\n既存スキップ: {} 件\n失敗: {} 件\n"
+                  L"参照パス更新: {} 件\n自動保存: {}",
+                  result.copied, result.skippedExisting, result.failed, updated,
+                  saveRequested ? (saved ? L"成功" : L"失敗") : L"なし");
+  if (logRequested)
+    resultMsg += std::format(L"\nログ出力: {}", logExported ? L"成功" : L"失敗");
+  if (resultRequested)
+    resultMsg +=
+        std::format(L"\n結果CSV出力: {}", resultExported ? L"成功" : L"失敗");
+  for (const auto &path : exportedPaths) {
+    resultMsg += L"\n  ";
+    resultMsg += path.wstring();
+  }
+  MessageBox(g_hWnd, resultMsg.c_str(), L"素材コピー",
+             (result.failed > 0 || (saveRequested && !saved) ||
+              (logRequested && !logExported) ||
+              (resultRequested && !resultExported))
+                 ? MB_ICONWARNING
+                 : MB_ICONINFORMATION);
+}
+
+static void OnBtnCopyFiles() {
+  if (!g_loaded)
+    return;
+
+  CopySettings settings = LoadCopySettings();
+
+  std::filesystem::path destRoot;
+  std::wstring suggestedFolder =
+      ExpandProjectFolderTemplate(settings.projectSideFolder);
+  auto projectSideDest = g_doc.sourcePath.parent_path() / suggestedFolder;
+
+  std::wstring destMsg =
+      L"プロジェクトファイル直下にコピー用フォルダを作成しますか？\n\n  " +
+      projectSideDest.wstring() + L"\n\nいいえを選ぶと任意フォルダを指定できます。";
+  int32_t destChoice = MessageBox(g_hWnd, destMsg.c_str(), L"素材コピー",
+                                  MB_YESNOCANCEL | MB_ICONQUESTION);
+  if (destChoice == IDCANCEL)
+    return;
+  if (destChoice == IDYES) {
+    destRoot = projectSideDest;
+  } else {
+    auto picked = PickFolder(L"コピー先フォルダを選択してください",
+                             g_doc.sourcePath.parent_path());
+    if (!picked)
+      return;
+    destRoot = *picked;
+  }
+
+  CopyPlan plan = BuildCopyPlan(settings, destRoot);
+  if (plan.items.empty()) {
+    MessageBox(g_hWnd, L"コピー候補になる参照ファイルがありません。", L"素材コピー",
+               MB_ICONINFORMATION);
+    return;
+  }
+
+  int32_t copyCount = 0;
+  int32_t askCount = 0;
+  int32_t skipCount = 0;
+  int32_t missingCount = 0;
+  int32_t destExistsCount = 0;
+  for (const auto &item : plan.items) {
+    if (!item.exists) {
+      ++missingCount;
+      continue;
+    }
+    if (item.action == CopyAction::Copy)
+      ++copyCount;
+    else if (item.action == CopyAction::Ask)
+      ++askCount;
+    else
+      ++skipCount;
+    if (item.destExists && item.action != CopyAction::Skip)
+      ++destExistsCount;
+  }
+
+  bool copyAskItems = false;
+  if (askCount > 0) {
+    std::wstring askMsg =
+        std::format(L"設定で ask になっているファイルが {} 件あります。\n"
+                    L"これらもコピー対象に含めますか？",
+                    askCount);
+    askMsg += DescribeFirstItems(plan, CopyAction::Ask, 8);
+    int32_t askChoice = MessageBox(g_hWnd, askMsg.c_str(), L"素材コピー",
+                                   MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (askChoice == IDCANCEL)
+      return;
+    copyAskItems = (askChoice == IDYES);
+  }
+
+  bool overwriteExisting = false;
+  if (destExistsCount > 0) {
+    if (settings.overwrite == OverwriteMode::Yes) {
+      overwriteExisting = true;
+    } else if (settings.overwrite == OverwriteMode::No) {
+      overwriteExisting = false;
+    } else {
+      std::wstring overwriteMsg =
+          std::format(L"コピー先に同名ファイルが {} 件あります。\n"
+                      L"上書きしますか？\n\n"
+                      L"いいえを選ぶと既存ファイルはスキップします。",
+                      destExistsCount);
+      int32_t overwriteChoice =
+          MessageBox(g_hWnd, overwriteMsg.c_str(), L"素材コピー",
+                     MB_YESNOCANCEL | MB_ICONWARNING);
+      if (overwriteChoice == IDCANCEL)
+        return;
+      overwriteExisting = (overwriteChoice == IDYES);
+    }
+  }
+
+  int32_t effectiveCopyCount = copyCount + (copyAskItems ? askCount : 0);
+  if (effectiveCopyCount == 0) {
+    MessageBox(g_hWnd, L"コピー対象がありません。", L"素材コピー",
+               MB_ICONINFORMATION);
+    return;
+  }
+
+  std::wstring confirmMsg =
+      std::format(L"コピー先:\n  {}\n\nコピー: {} 件\n確認扱い: {} 件{}\n除外: {} 件\n"
+                  L"見つからない: {} 件\n\n実行しますか？",
+                  destRoot.wstring(), copyCount, askCount,
+                  copyAskItems ? L" (コピーします)" : L" (スキップします)",
+                  skipCount, missingCount);
+  if (!DescribeFirstItems(plan, CopyAction::Skip, 5).empty()) {
+    confirmMsg += L"\n\n除外例:";
+    confirmMsg += DescribeFirstItems(plan, CopyAction::Skip, 5);
+  }
+
+  if (MessageBox(g_hWnd, confirmMsg.c_str(), L"素材コピー",
+                 MB_YESNO | MB_ICONQUESTION) != IDYES) {
+    return;
+  }
+
+  bool updatePaths = false;
+  if (settings.updatePathsAfterCopy == UpdatePathsMode::Yes) {
+    updatePaths = true;
+  } else if (settings.updatePathsAfterCopy == UpdatePathsMode::Ask) {
+    int32_t updateChoice =
+        MessageBox(g_hWnd,
+                   L"コピーに成功したファイルの参照パスをコピー先へ変更しますか？",
+                   L"素材コピー", MB_YESNO | MB_ICONQUESTION);
+    updatePaths = (updateChoice == IDYES);
+  }
+
+  StartCopyWorker(std::move(plan), copyAskItems, overwriteExisting, updatePaths,
+                  settings.exportLog, settings.exportResult,
+                  settings.saveAfterUpdate);
+}
+
 static void OnBtnCheck() {
   if (!g_loaded)
     return;
@@ -451,6 +1476,39 @@ static void OnBtnCheck() {
              ng > 0 ? MB_ICONWARNING : MB_ICONINFORMATION);
 }
 
+static void OnBtnCheckExport() {
+  if (!g_loaded)
+    return;
+
+  g_checkResults = CheckPaths(g_doc);
+  ListViewPopulate();
+
+  int32_t ng = 0;
+  for (const auto &r : g_checkResults)
+    if (!r.exists)
+      ++ng;
+
+  std::wstring defaultName =
+      g_doc.sourcePath.stem().wstring() + L"_check_" + MakeTimestamp() + L".csv";
+  auto exportPath = PickSavePath(
+      L"チェック結果の保存先を選択してください",
+      L"CSV Files (*.csv)\0*.csv\0All Files (*.*)\0*.*\0",
+      g_doc.sourcePath.parent_path(), defaultName, L"csv");
+  if (!exportPath)
+    return;
+
+  bool exported = WriteCheckResultCsv(g_doc, g_checkResults, *exportPath);
+  std::wstring resultMsg =
+      std::format(L"チェック完了: {} 件中 {} 件が見つかりません。\n結果CSV出力: {}",
+                  g_checkResults.size(), ng, exported ? L"成功" : L"失敗");
+  if (exported) {
+    resultMsg += L"\n  ";
+    resultMsg += exportPath->wstring();
+  }
+  MessageBox(g_hWnd, resultMsg.c_str(), L"チェック結果",
+             (!exported || ng > 0) ? MB_ICONWARNING : MB_ICONINFORMATION);
+}
+
 static void OnBtnSave() {
   if (!g_loaded)
     return;
@@ -458,6 +1516,13 @@ static void OnBtnSave() {
 }
 
 static void OnDropFiles(HDROP hDrop) {
+  if (g_copyInProgress) {
+    DragFinish(hDrop);
+    MessageBox(g_hWnd, L"素材コピーが完了するまでお待ちください。", L"確認",
+               MB_ICONINFORMATION);
+    return;
+  }
+
   if (!ConfirmSaveIfDirty()) {
     DragFinish(hDrop);
     return;
@@ -476,6 +1541,8 @@ static void OnSize(int32_t cx, int32_t cy) {
   constexpr int32_t MARGIN = 8;
   constexpr int32_t BTN_W = 72;
   constexpr int32_t MID_BTN_W = 120;
+  constexpr int32_t COPY_BTN_W = 128;
+  constexpr int32_t CHECK_EXPORT_BTN_W = 192;
   constexpr int32_t BTN_H = 24;
   constexpr int32_t ROW_H = 32;
   constexpr int32_t BOTTOM = 36;
@@ -492,10 +1559,18 @@ static void OnSize(int32_t cx, int32_t cy) {
   y += listH + 4;
 
   MoveWindow(GetDlgItem(g_hWnd, ID_BTN_CHECK), MARGIN, y, BTN_W, BTN_H, TRUE);
-  MoveWindow(GetDlgItem(g_hWnd, ID_BTN_EDITSEL), MARGIN + BTN_W + 4, y, MID_BTN_W,
-             BTN_H, TRUE);
+  MoveWindow(GetDlgItem(g_hWnd, ID_BTN_CHECKEXPORT), MARGIN + BTN_W + 4, y,
+             CHECK_EXPORT_BTN_W, BTN_H, TRUE);
+  MoveWindow(GetDlgItem(g_hWnd, ID_BTN_EDITSEL),
+             MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4, y, MID_BTN_W, BTN_H,
+             TRUE);
   MoveWindow(GetDlgItem(g_hWnd, ID_BTN_REPLACEROOT),
-             MARGIN + BTN_W + 4 + MID_BTN_W + 4, y, MID_BTN_W, BTN_H, TRUE);
+             MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4 + MID_BTN_W + 4, y,
+             MID_BTN_W, BTN_H, TRUE);
+  MoveWindow(GetDlgItem(g_hWnd, ID_BTN_COPYFILES),
+             MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4 + MID_BTN_W + 4 +
+                 MID_BTN_W + 4,
+             y, COPY_BTN_W, BTN_H, TRUE);
   MoveWindow(GetDlgItem(g_hWnd, ID_BTN_SAVE), cx - MARGIN - BTN_W, y, BTN_W,
              BTN_H, TRUE);
 }
@@ -539,6 +1614,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
       CreateWindow(L"BUTTON", L"チェック",
                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
                    ControlId(ID_BTN_CHECK), hi, nullptr);
+      CreateWindow(L"BUTTON", L"チェック結果出力",
+                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
+                   ControlId(ID_BTN_CHECKEXPORT), hi, nullptr);
       CreateWindow(L"BUTTON", L"選択行を変更",
                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
                    ControlId(ID_BTN_EDITSEL), hi, nullptr);
@@ -547,6 +1625,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
       CreateWindow(L"BUTTON", L"ルート一括置換",
                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
                    ControlId(ID_BTN_REPLACEROOT), hi, nullptr);
+      CreateWindow(L"BUTTON", L"素材をコピー",
+                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
+                   ControlId(ID_BTN_COPYFILES), hi, nullptr);
 
       DragAcceptFiles(hWnd, TRUE);
       UpdateWindowTitle();
@@ -566,6 +1647,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
       case ID_BTN_CHECK:
         OnBtnCheck();
         break;
+      case ID_BTN_CHECKEXPORT:
+        OnBtnCheckExport();
+        break;
       case ID_BTN_EDITSEL:
         OnBtnEditSel();
         break;
@@ -575,10 +1659,26 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
       case ID_BTN_REPLACEROOT:
         OnBtnReplaceRoot();
         break;
+      case ID_BTN_COPYFILES:
+        OnBtnCopyFiles();
+        break;
       }
       return 0;
 
+    case WM_COPYFILES_DONE: {
+      std::unique_ptr<CopyExecutionResult> result(
+          reinterpret_cast<CopyExecutionResult *>(lp));
+      if (result)
+        FinishCopyFiles(*result);
+      return 0;
+    }
+
     case WM_CLOSE:
+      if (g_copyInProgress) {
+        MessageBox(hWnd, L"素材コピーが完了するまでお待ちください。", L"確認",
+                   MB_ICONINFORMATION);
+        return 0;
+      }
       if (!ConfirmSaveIfDirty())
         return 0;
       DestroyWindow(hWnd);

@@ -13,9 +13,11 @@ AviUtl ExEdit2 のプロジェクトファイル (.aup2) が参照している�
 
 - プロジェクトが参照しているファイルの一覧表示
 - ファイルの存在チェック（OK / NG 表示）
+- ファイルの存在チェック結果のCSV出力
 - パスの個別変更（同じファイルを参照している行をまとめて変更可能）
 - 書き換え前の自動バックアップ（`.aup2.bak`）
 - プロジェクトファイル自体の記録パスと実際のパスの不一致検出
+- 参照素材のコピー（外部設定ファイルでコピー/除外/確認ルールを編集可能）
 
 ## 動作要件
 
@@ -35,6 +37,9 @@ AviUtl ExEdit2 のプロジェクトファイル (.aup2) が参照している�
 - `OK` — ファイルが見つかった
 - `NG` — ファイルが見つからない
 
+「チェック結果出力」ボタンを押すと、存在チェックを実行したうえで結果をCSVに保存できます。  
+CSVには、各参照ファイルの `status`、`key`、`path`、`is_project_file`、`project` が出力されます。
+
 ### パスの変更
 
 1. 一覧から変更したい行を選択します
@@ -45,6 +50,199 @@ AviUtl ExEdit2 のプロジェクトファイル (.aup2) が参照している�
 
 「保存」ボタンを押すと `.aup2` ファイルに書き戻します  
 書き戻しの直前に `.aup2.bak` が自動作成されます
+
+### 参照素材のコピー
+
+「素材をコピー」ボタンを押すと、プロジェクトが参照しているファイルを指定フォルダへコピーできます。  
+コピー後に、プロジェクト内の参照パスをコピー先へ変更することもできます。
+
+コピー対象の判定は、実行ファイルと同じフォルダにある `aviutl2_relink.copy.ini` で設定します。  
+設定ファイルがない場合は初回実行時に自動作成されます。
+
+設定例:
+
+```ini
+default_action=ask
+preserve_tree=drive
+project_side_folder={project_name}_files
+update_paths_after_copy=ask
+overwrite=ask
+export_log=ask
+export_result=ask
+save_after_update=ask
+
+skip=*.dll|binary/plugin
+ask=*.lua|script
+copy=*.wav
+copy=*.png
+copy=C:/素材/**
+```
+
+- `copy=pattern` — 一致したファイルをコピーします
+- `skip=pattern` — 一致したファイルを除外します
+- `ask=pattern` — 実行時にコピーするか確認します
+- `default_action` — どのルールにも一致しなかった場合の動作です（`copy` / `skip` / `ask`）
+- `preserve_tree` — コピー先の配置方法です（`flat` / `drive` / `common_root`）
+- `project_side_folder` — プロジェクトファイル直下へコピーする場合のフォルダ名です
+- `update_paths_after_copy` — コピー後に参照パスを更新するかの動作です（`yes` / `no` / `ask`）
+- `overwrite` — コピー先に同名ファイルがある場合の動作です（`yes` / `no` / `ask`）
+- `export_log` — コピー後にログファイルを出力するかの動作です（`yes` / `no` / `ask`）
+- `export_result` — コピー後に結果CSVを出力するかの動作です（`yes` / `no` / `ask`）
+- `save_after_update` — 参照パス更新後に `.aup2` を保存するかの動作です（`yes` / `no` / `ask`）
+
+ルールは上から順に評価されます。  
+`*.wav` のようにスラッシュを含まないパターンはファイル名に対して、`C:/素材/**` のようにスラッシュを含むパターンはフルパスに対して判定されます。
+
+#### ルールの動作
+
+`copy` / `skip` / `ask` は、どれも同じ形式で書きます。
+
+```ini
+copy=*.wav
+skip=*.dll|binary/plugin
+ask=*.lua|script
+```
+
+`|` の右側は理由メモです。省略できます。  
+`skip` や `ask` の理由は、確認ダイアログの表示に使われます。
+
+ルールは上から順に評価され、最初に一致したルールだけが使われます。
+
+```ini
+skip=C:/Program Files/**
+copy=*.wav
+```
+
+この場合、`C:/Program Files/Vendor/sample.wav` は `*.wav` にも一致しますが、先に `skip=C:/Program Files/**` に一致するため除外されます。
+
+#### パターンの書き方
+
+パターンには `*`、`**`、`?` が使えます。大文字小文字は区別しません。
+
+- `*.wav` — 拡張子が `.wav` のファイルに一致します
+- `voice_??.png` — `voice_01.png` や `voice_ab.png` に一致します
+- `C:/素材/**` — `C:/素材/` 以下のファイルに一致します
+- `D:/work/*.mp4` — `D:/work/` 直下の `.mp4` に一致します
+
+`*` と `?` はフォルダ区切り `/` をまたぎません。  
+サブフォルダ以下も含めたい場合は `**` を使います。
+
+スラッシュ `/` またはドライブ指定 `C:` を含むパターンはフルパスに対して判定されます。  
+それ以外のパターンはファイル名だけに対して判定されます。
+
+#### `default_action`
+
+どのルールにも一致しなかったファイルの扱いです。
+
+- `copy` — 既知/未知を問わずコピーします
+- `skip` — ルールに書いたものだけをコピー対象にします
+- `ask` — ルールにないものは実行時に確認します
+
+安全寄りに使うなら `ask`、素材拡張子を明示管理したいなら `skip` が向いています。
+
+#### `preserve_tree`
+
+コピー先でフォルダ構造をどう作るかを指定します。  
+例として、コピー先が `C:/archive/sample_files/` で、参照ファイルが以下の場合:
+
+```text
+D:/素材/voice/a.wav
+D:/素材/image/bg.png
+E:/download/bg.png
+```
+
+`flat` は、すべてコピー先直下に置きます。
+
+```text
+C:/archive/sample_files/a.wav
+C:/archive/sample_files/bg.png
+C:/archive/sample_files/bg (2).png
+```
+
+同名ファイルがある場合は、コピー計画上で `bg (2).png` のように名前を分けます。  
+ファイル数が少ない時は見やすいですが、元の場所の情報は失われます。
+
+`drive` は、ドライブ名から下の構造を残します。
+
+```text
+C:/archive/sample_files/D_/素材/voice/a.wav
+C:/archive/sample_files/D_/素材/image/bg.png
+C:/archive/sample_files/E_/download/bg.png
+```
+
+同名ファイルの衝突を避けやすく、別ドライブの素材も混ざりにくいです。初期値はこれです。
+
+`common_root` は、コピー対象の共通フォルダからの相対パスを残します。
+
+```text
+C:/archive/sample_files/voice/a.wav
+C:/archive/sample_files/image/bg.png
+```
+
+上の2つだけが対象なら共通フォルダは `D:/素材/` なので、その下の構造だけを残します。  
+ただし、複数ドライブにまたがるなど共通フォルダがうまく取れない場合は `drive` 相当の配置になります。
+
+#### `project_side_folder`
+
+「プロジェクトファイル直下にコピー」を選んだ時に作るフォルダ名です。  
+`{project_name}` は `.aup2` のファイル名に置き換わります。
+
+```ini
+project_side_folder={project_name}_files
+```
+
+`C:/work/demo.aup2` なら、コピー先は `C:/work/demo_files/` になります。
+
+#### `update_paths_after_copy`
+
+コピーに成功したファイルについて、`.aup2` 内の参照パスをコピー先に書き換えるかを指定します。
+
+- `yes` — 常に書き換えます
+- `no` — コピーだけ行い、参照パスは変えません
+- `ask` — 実行時に確認します
+
+書き換えた場合は未保存状態になります。保存時には通常通り `.aup2.bak` が作成されます。
+
+#### `save_after_update`
+
+コピー後に参照パスを書き換えた場合だけ、`.aup2` を保存するかを指定します。  
+参照パスを変更しなかった場合や、変更件数が0件だった場合は保存しません。
+
+- `yes` — 参照パス更新後に自動保存します
+- `no` — 自動保存しません
+- `ask` — 参照パス更新後に確認します
+
+保存時には通常通り `.aup2.bak` が作成されます。
+
+#### `overwrite`
+
+コピー先に同名ファイルがすでにある場合の動作です。
+
+- `yes` — 上書きします
+- `no` — 既存ファイルはスキップします
+- `ask` — 実行時に確認します
+
+#### `export_log`
+
+コピー後に、人間が読むためのログを `.log` で出力するかを指定します。
+
+- `yes` — 常に出力します
+- `no` — 出力しません
+- `ask` — コピー後に確認します
+
+ログには、コピー元、コピー先、コピー件数、失敗件数、除外理由、参照パス更新件数、自動保存結果が含まれます。  
+出力先はコピー先フォルダで、ファイル名は `{project_name}_copy_YYYYMMDD_HHMMSS.log` です。
+
+#### `export_result`
+
+コピー後に、表計算ソフトで確認しやすい結果CSVを出力するかを指定します。
+
+- `yes` — 常に出力します
+- `no` — 出力しません
+- `ask` — コピー後に確認します
+
+CSVには、各参照ファイルの `result`、`action`、`source`、`destination`、`reason`、`detail` が出力されます。  
+出力先はコピー先フォルダで、ファイル名は `{project_name}_copy_YYYYMMDD_HHMMSS.csv` です。
 
 ## License
 
