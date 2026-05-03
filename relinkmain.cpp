@@ -19,7 +19,7 @@
 #include <thread>
 #include <vector>
 
-constexpr wchar_t APP_TITLE_BASE[] = L"aviutl2_relink v0.0.3";
+constexpr wchar_t APP_TITLE_BASE[] = L"aviutl2_relink v0.0.4";
 constexpr wchar_t COPY_RULES_FILE[] = L"aviutl2_relink.copy.ini";
 
 constexpr int32_t ID_BTN_OPEN = 101;
@@ -31,6 +31,7 @@ constexpr int32_t ID_BTN_SAVE = 106;
 constexpr int32_t ID_BTN_REPLACEROOT = 107;
 constexpr int32_t ID_BTN_COPYFILES = 108;
 constexpr int32_t ID_BTN_CHECKEXPORT = 109;
+constexpr int32_t ID_BTN_RELINK_PROJECT_FILES = 110;
 constexpr int32_t COL_STATUS = 0;
 constexpr int32_t COL_KEY = 1;
 constexpr int32_t COL_PATH = 2;
@@ -96,6 +97,11 @@ struct CopyExecutionResult {
   UpdatePathsMode exportLog = UpdatePathsMode::No;
   UpdatePathsMode exportResult = UpdatePathsMode::No;
   UpdatePathsMode saveAfterUpdate = UpdatePathsMode::No;
+};
+
+struct RelinkPlanItem {
+  PathEntry *entry = nullptr;
+  std::filesystem::path newPath;
 };
 
 static HWND g_hWnd = nullptr;
@@ -185,6 +191,8 @@ static void UpdateControlStates() {
                g_loaded && !g_copyInProgress);
   EnableWindow(GetDlgItem(g_hWnd, ID_BTN_EDITSEL), g_loaded && !g_copyInProgress);
   EnableWindow(GetDlgItem(g_hWnd, ID_BTN_REPLACEROOT), g_loaded && !g_copyInProgress);
+  EnableWindow(GetDlgItem(g_hWnd, ID_BTN_RELINK_PROJECT_FILES),
+               g_loaded && !g_copyInProgress);
   EnableWindow(GetDlgItem(g_hWnd, ID_BTN_COPYFILES), g_loaded && !g_copyInProgress);
   EnableWindow(GetDlgItem(g_hWnd, ID_BTN_SAVE), g_loaded && g_dirty && !g_copyInProgress);
 }
@@ -566,6 +574,33 @@ static std::filesystem::path RelativePathForCopy(
     result /= source.filename();
 
   return result;
+}
+
+static std::optional<std::filesystem::path> RelativePathAfterFolder(
+    const std::filesystem::path &path, const std::wstring &folderName) {
+  if (folderName.empty())
+    return std::nullopt;
+
+  auto normalized = path.lexically_normal();
+  bool found = false;
+  std::filesystem::path relative;
+
+  for (const auto &part : normalized) {
+    if (EqualsIgnoreCase(part.wstring(), folderName)) {
+      found = true;
+      relative.clear();
+      continue;
+    }
+
+    if (found) {
+      relative /= part;
+      continue;
+    }
+  }
+
+  if (!found || relative.empty())
+    return std::nullopt;
+  return relative;
 }
 
 static std::filesystem::path ComputeCommonRoot(
@@ -1150,6 +1185,119 @@ static void OnBtnReplaceRoot() {
   MessageBox(g_hWnd, msg.c_str(), L"ルート一括置換", MB_ICONINFORMATION);
 }
 
+static void OnBtnRelinkProjectFiles() {
+  if (!g_loaded)
+    return;
+
+  CopySettings settings = LoadCopySettings();
+  std::wstring folderName = ExpandProjectFolderTemplate(settings.projectSideFolder);
+  std::filesystem::path currentRoot = g_doc.sourcePath.parent_path() / folderName;
+
+  if (!std::filesystem::exists(currentRoot)) {
+    std::wstring msg =
+        L"プロジェクト直下の素材フォルダが見つかりません。\n\n  " +
+        currentRoot.wstring() + L"\n\n別のフォルダを指定しますか？";
+    if (MessageBox(g_hWnd, msg.c_str(), L"直下素材へ再リンク",
+                   MB_YESNO | MB_ICONQUESTION) != IDYES) {
+      return;
+    }
+
+    auto picked = PickFolder(L"現在の素材フォルダを選択してください",
+                             g_doc.sourcePath.parent_path());
+    if (!picked)
+      return;
+    currentRoot = *picked;
+    folderName = currentRoot.filename().wstring();
+  }
+
+  int32_t updated = 0;
+  int32_t alreadyCurrent = 0;
+  int32_t noTrace = 0;
+  int32_t missing = 0;
+  std::vector<RelinkPlanItem> plan;
+
+  for (auto &entry : g_doc.entries) {
+    if (entry.isProjectFile)
+      continue;
+
+    auto relative = RelativePathAfterFolder(PathFromUtf8(entry.path), folderName);
+    if (!relative) {
+      ++noTrace;
+      continue;
+    }
+
+    auto newPath = NormalizePathForCompare(currentRoot / *relative);
+    if (!std::filesystem::exists(newPath)) {
+      ++missing;
+      continue;
+    }
+
+    if (PathsReferToSameLocation(PathFromUtf8(entry.path), newPath)) {
+      ++alreadyCurrent;
+      continue;
+    }
+
+    plan.push_back(RelinkPlanItem{&entry, newPath});
+  }
+
+  updated = static_cast<int32_t>(plan.size());
+  if (updated == 0) {
+    std::wstring msg =
+        std::format(L"置換できる参照パスはありませんでした。\n\n"
+                    L"既に現在の場所: {} 件\n"
+                    L"素材フォルダの痕跡なし: {} 件\n"
+                    L"移動先にファイルなし: {} 件",
+                    alreadyCurrent, noTrace, missing);
+    MessageBox(g_hWnd, msg.c_str(), L"直下素材へ再リンク",
+               MB_ICONINFORMATION);
+    return;
+  }
+
+  std::wstring confirmMsg =
+      std::format(L"{} 件の参照パスを現在の素材フォルダへ置換します。\n\n"
+                  L"素材フォルダ:\n  {}\n\n"
+                  L"既に現在の場所: {} 件\n"
+                  L"素材フォルダの痕跡なし: {} 件\n"
+                  L"移動先にファイルなし: {} 件",
+                  updated, currentRoot.wstring(), alreadyCurrent, noTrace,
+                  missing);
+  int32_t previewCount = (std::min)(updated, 3);
+  if (previewCount > 0) {
+    confirmMsg += L"\n\n置換例:";
+    for (int32_t i = 0; i < previewCount; ++i) {
+      confirmMsg += L"\n  ";
+      confirmMsg += ToWide(plan[i].entry->path);
+      confirmMsg += L"\n  -> ";
+      confirmMsg += plan[i].newPath.wstring();
+    }
+  }
+  confirmMsg += L"\n\n実行しますか？";
+
+  if (MessageBox(g_hWnd, confirmMsg.c_str(), L"直下素材へ再リンク",
+                 MB_YESNO | MB_ICONWARNING) != IDYES) {
+    return;
+  }
+
+  for (const auto &item : plan) {
+    item.entry->path = ToUtf8(item.newPath.wstring());
+  }
+
+  g_checkResults.clear();
+  SetDirty(true);
+  ListViewPopulate();
+
+  std::wstring msg =
+      std::format(L"{} 件の参照パスを現在の素材フォルダへ置換しました。\n\n"
+                  L"素材フォルダ:\n  {}\n\n"
+                  L"既に現在の場所: {} 件\n"
+                  L"素材フォルダの痕跡なし: {} 件\n"
+                  L"移動先にファイルなし: {} 件",
+                  updated, currentRoot.wstring(), alreadyCurrent, noTrace,
+                  missing);
+  MessageBox(g_hWnd, msg.c_str(), L"直下素材へ再リンク",
+             MB_ICONINFORMATION);
+}
+
 static void StartCopyWorker(CopyPlan plan, bool copyAskItems,
                             bool overwriteExisting, bool updatePaths,
                             UpdatePathsMode exportLog,
@@ -1540,9 +1688,10 @@ static void OnDropFiles(HDROP hDrop) {
 static void OnSize(int32_t cx, int32_t cy) {
   constexpr int32_t MARGIN = 8;
   constexpr int32_t BTN_W = 72;
-  constexpr int32_t MID_BTN_W = 120;
-  constexpr int32_t COPY_BTN_W = 128;
-  constexpr int32_t CHECK_EXPORT_BTN_W = 192;
+  constexpr int32_t MID_BTN_W = 128;
+  constexpr int32_t RELINK_BTN_W = 164;
+  constexpr int32_t COPY_BTN_W = 112;
+  constexpr int32_t CHECK_EXPORT_BTN_W = 152;
   constexpr int32_t BTN_H = 24;
   constexpr int32_t ROW_H = 32;
   constexpr int32_t BOTTOM = 36;
@@ -1567,9 +1716,13 @@ static void OnSize(int32_t cx, int32_t cy) {
   MoveWindow(GetDlgItem(g_hWnd, ID_BTN_REPLACEROOT),
              MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4 + MID_BTN_W + 4, y,
              MID_BTN_W, BTN_H, TRUE);
-  MoveWindow(GetDlgItem(g_hWnd, ID_BTN_COPYFILES),
+  MoveWindow(GetDlgItem(g_hWnd, ID_BTN_RELINK_PROJECT_FILES),
              MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4 + MID_BTN_W + 4 +
                  MID_BTN_W + 4,
+             y, RELINK_BTN_W, BTN_H, TRUE);
+  MoveWindow(GetDlgItem(g_hWnd, ID_BTN_COPYFILES),
+             MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4 + MID_BTN_W + 4 +
+                 MID_BTN_W + 4 + RELINK_BTN_W + 4,
              y, COPY_BTN_W, BTN_H, TRUE);
   MoveWindow(GetDlgItem(g_hWnd, ID_BTN_SAVE), cx - MARGIN - BTN_W, y, BTN_W,
              BTN_H, TRUE);
@@ -1625,6 +1778,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
       CreateWindow(L"BUTTON", L"ルート一括置換",
                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
                    ControlId(ID_BTN_REPLACEROOT), hi, nullptr);
+      CreateWindow(L"BUTTON", L"直下素材へ再リンク",
+                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
+                   ControlId(ID_BTN_RELINK_PROJECT_FILES), hi, nullptr);
       CreateWindow(L"BUTTON", L"素材をコピー",
                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
                    ControlId(ID_BTN_COPYFILES), hi, nullptr);
@@ -1658,6 +1814,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
         break;
       case ID_BTN_REPLACEROOT:
         OnBtnReplaceRoot();
+        break;
+      case ID_BTN_RELINK_PROJECT_FILES:
+        OnBtnRelinkProjectFiles();
         break;
       case ID_BTN_COPYFILES:
         OnBtnCopyFiles();
