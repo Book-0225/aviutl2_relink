@@ -36,6 +36,12 @@ std::optional<Aup2Document> ParseAup2(const std::filesystem::path &path) {
 
   Aup2Document doc;
   doc.sourcePath = path;
+  {
+    std::error_code ec;
+    auto writeTime = std::filesystem::last_write_time(path, ec);
+    if (!ec)
+      doc.loadedWriteTime = writeTime;
+  }
 
   std::string line;
   bool inProjectSection = false;
@@ -109,7 +115,17 @@ bool SaveAup2(Aup2Document &doc, const std::filesystem::path &destPath) {
       ofs << "\r\n";
   }
 
-  return ofs.good();
+  if (!ofs.good())
+    return false;
+  ofs.close();
+  if (!ofs)
+    return false;
+
+  std::error_code ec;
+  auto writeTime = std::filesystem::last_write_time(destPath, ec);
+  if (!ec)
+    doc.loadedWriteTime = writeTime;
+  return true;
 }
 
 std::vector<CheckResult> CheckPaths(const Aup2Document &doc) {

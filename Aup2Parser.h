@@ -13,6 +13,7 @@ struct PathEntry {
 
 struct Aup2Document {
   std::filesystem::path sourcePath;
+  std::optional<std::filesystem::file_time_type> loadedWriteTime;
   std::vector<std::string> lines;
   std::vector<PathEntry> entries;
   std::optional<size_t> projectFileLineno;

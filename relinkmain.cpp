@@ -32,6 +32,9 @@ constexpr int32_t ID_BTN_REPLACEROOT = 107;
 constexpr int32_t ID_BTN_COPYFILES = 108;
 constexpr int32_t ID_BTN_CHECKEXPORT = 109;
 constexpr int32_t ID_BTN_RELINK_PROJECT_FILES = 110;
+constexpr int32_t ID_EDIT_FILTER = 111;
+constexpr int32_t ID_CHECK_NGONLY = 112;
+constexpr int32_t ID_STATIC_FILTER = 113;
 constexpr int32_t COL_STATUS = 0;
 constexpr int32_t COL_KEY = 1;
 constexpr int32_t COL_PATH = 2;
@@ -111,6 +114,7 @@ static bool g_loaded = false;
 static bool g_dirty = false;
 static bool g_copyInProgress = false;
 static std::vector<CheckResult> g_checkResults;
+static std::vector<size_t> g_visibleEntries;
 
 static std::wstring ToWide(const std::string &s) {
   if (s.empty())
@@ -195,6 +199,8 @@ static void UpdateControlStates() {
                g_loaded && !g_copyInProgress);
   EnableWindow(GetDlgItem(g_hWnd, ID_BTN_COPYFILES), g_loaded && !g_copyInProgress);
   EnableWindow(GetDlgItem(g_hWnd, ID_BTN_SAVE), g_loaded && g_dirty && !g_copyInProgress);
+  EnableWindow(GetDlgItem(g_hWnd, ID_EDIT_FILTER), g_loaded && !g_copyInProgress);
+  EnableWindow(GetDlgItem(g_hWnd, ID_CHECK_NGONLY), g_loaded && !g_copyInProgress);
 }
 
 static void SetDirty(bool dirty) {
@@ -352,6 +358,56 @@ static bool PatternMatchesPath(const std::wstring &pattern,
 
   const std::wstring &target = pathPattern ? full : filename;
   return WildcardMatch(normalizedPattern.c_str(), target.c_str());
+}
+
+static std::wstring GetControlText(HWND hwnd) {
+  int32_t len = GetWindowTextLength(hwnd);
+  if (len <= 0)
+    return {};
+
+  std::wstring text(static_cast<size_t>(len) + 1, L'\0');
+  GetWindowText(hwnd, text.data(), len + 1);
+  text.resize(static_cast<size_t>(len));
+  return text;
+}
+
+static bool IsEntryMissing(const PathEntry &entry) {
+  if (g_checkResults.empty())
+    return false;
+
+  for (const auto &result : g_checkResults) {
+    if (result.entry == &entry)
+      return !result.exists;
+  }
+  return false;
+}
+
+static bool EntryMatchesCurrentFilter(const PathEntry &entry) {
+  HWND ngOnly = GetDlgItem(g_hWnd, ID_CHECK_NGONLY);
+  if (ngOnly && SendMessage(ngOnly, BM_GETCHECK, 0, 0) == BST_CHECKED &&
+      !IsEntryMissing(entry)) {
+    return false;
+  }
+
+  HWND filterEdit = GetDlgItem(g_hWnd, ID_EDIT_FILTER);
+  std::wstring filter = ToLower(Trim(GetControlText(filterEdit)));
+  if (filter.empty())
+    return true;
+
+  std::wstring key = ToLower(ToWide(entry.key));
+  std::wstring path = ToLower(ToWide(entry.path));
+  return key.find(filter) != std::wstring::npos ||
+         path.find(filter) != std::wstring::npos;
+}
+
+static PathEntry *EntryFromVisibleRow(int32_t row) {
+  if (row < 0 || row >= static_cast<int32_t>(g_visibleEntries.size()))
+    return nullptr;
+
+  size_t entryIndex = g_visibleEntries[static_cast<size_t>(row)];
+  if (entryIndex >= g_doc.entries.size())
+    return nullptr;
+  return &g_doc.entries[entryIndex];
 }
 
 static std::filesystem::path GetExeDirectory() {
@@ -938,6 +994,21 @@ PickSavePath(const std::wstring &title, const std::wstring &filter,
 static bool SaveCurrentDocument() {
   if (!g_loaded)
     return true;
+  if (g_doc.loadedWriteTime) {
+    std::error_code ec;
+    auto currentWriteTime = std::filesystem::last_write_time(g_doc.sourcePath, ec);
+    if (!ec && currentWriteTime != *g_doc.loadedWriteTime) {
+      std::wstring msg =
+          L"読み込み後にプロジェクトファイルが外部で更新されています。\n\n  " +
+          g_doc.sourcePath.wstring() +
+          L"\n\nこのまま保存すると、外部で更新された内容を上書きする可能性があります。\n"
+          L"保存を続行しますか？";
+      if (MessageBox(g_hWnd, msg.c_str(), L"外部更新の検出",
+                     MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+        return false;
+      }
+    }
+  }
   if (!SaveAup2(g_doc, g_doc.sourcePath)) {
     MessageBox(g_hWnd, L"保存に失敗しました。", L"エラー", MB_ICONERROR);
     return false;
@@ -965,9 +1036,12 @@ static bool ConfirmSaveIfDirty() {
 
 static void ListViewPopulate() {
   ListView_DeleteAllItems(g_hList);
+  g_visibleEntries.clear();
 
   for (size_t i = 0; i < g_doc.entries.size(); ++i) {
     const auto &entry = g_doc.entries[i];
+    if (!EntryMatchesCurrentFilter(entry))
+      continue;
 
     bool exists = false;
     bool checked = !g_checkResults.empty();
@@ -980,19 +1054,20 @@ static void ListViewPopulate() {
 
     LVITEM lvi{};
     lvi.mask = LVIF_TEXT;
-    lvi.iItem = static_cast<int32_t>(i);
+    lvi.iItem = static_cast<int32_t>(g_visibleEntries.size());
     lvi.iSubItem = COL_STATUS;
     std::wstring status = !checked ? L"-" : (exists ? L"OK" : L"NG");
     lvi.pszText = status.data();
     ListView_InsertItem(g_hList, &lvi);
+    g_visibleEntries.push_back(i);
 
     std::wstring key = ToWide(entry.key);
-    ListView_SetItemText(g_hList, static_cast<int32_t>(i), COL_KEY, key.data());
+    ListView_SetItemText(g_hList, lvi.iItem, COL_KEY, key.data());
 
     std::wstring path = ToWide(entry.path);
     if (entry.isProjectFile)
       path = L"[project] " + path;
-    ListView_SetItemText(g_hList, static_cast<int32_t>(i), COL_PATH, path.data());
+    ListView_SetItemText(g_hList, lvi.iItem, COL_PATH, path.data());
   }
 }
 
@@ -1054,13 +1129,13 @@ static void OnBtnEditSel() {
     return;
 
   int32_t sel = ListView_GetNextItem(g_hList, -1, LVNI_SELECTED);
-  if (sel < 0 || sel >= static_cast<int32_t>(g_doc.entries.size())) {
+  PathEntry *selEntry = EntryFromVisibleRow(sel);
+  if (!selEntry) {
     MessageBox(g_hWnd, L"行を選択してください。", L"確認", MB_ICONINFORMATION);
     return;
   }
 
-  auto &selEntry = g_doc.entries[sel];
-  const std::string oldPath = selEntry.path;
+  const std::string oldPath = selEntry->path;
 
   std::vector<WCHAR> buf(32768, L'\0');
   std::wstring initialPath = ToWide(oldPath);
@@ -1085,7 +1160,7 @@ static void OnBtnEditSel() {
 
   std::vector<size_t> sameIndices;
   for (size_t i = 0; i < g_doc.entries.size(); ++i) {
-    if (static_cast<int32_t>(i) == sel)
+    if (&g_doc.entries[i] == selEntry)
       continue;
     if (g_doc.entries[i].isProjectFile)
       continue;
@@ -1107,7 +1182,7 @@ static void OnBtnEditSel() {
   if (newPath == oldPath)
     return;
 
-  selEntry.path = newPath;
+  selEntry->path = newPath;
 
   if (updateAll) {
     for (size_t idx : sameIndices) {
@@ -1126,8 +1201,8 @@ static void OnBtnReplaceRoot() {
 
   std::filesystem::path suggestedRoot;
   int32_t sel = ListView_GetNextItem(g_hList, -1, LVNI_SELECTED);
-  if (sel >= 0 && sel < static_cast<int32_t>(g_doc.entries.size())) {
-    suggestedRoot = PathFromUtf8(g_doc.entries[sel].path).parent_path();
+  if (PathEntry *entry = EntryFromVisibleRow(sel)) {
+    suggestedRoot = PathFromUtf8(entry->path).parent_path();
   } else if (!g_doc.entries.empty()) {
     suggestedRoot = PathFromUtf8(g_doc.entries.front().path).parent_path();
   }
@@ -1692,6 +1767,8 @@ static void OnSize(int32_t cx, int32_t cy) {
   constexpr int32_t RELINK_BTN_W = 164;
   constexpr int32_t COPY_BTN_W = 112;
   constexpr int32_t CHECK_EXPORT_BTN_W = 152;
+  constexpr int32_t FILTER_LABEL_W = 64;
+  constexpr int32_t NG_ONLY_W = 96;
   constexpr int32_t BTN_H = 24;
   constexpr int32_t ROW_H = 32;
   constexpr int32_t BOTTOM = 36;
@@ -1701,6 +1778,14 @@ static void OnSize(int32_t cx, int32_t cy) {
   MoveWindow(GetDlgItem(g_hWnd, ID_BTN_OPEN), MARGIN, y, BTN_W, BTN_H, TRUE);
   MoveWindow(GetDlgItem(g_hWnd, ID_EDIT_FILEPATH), MARGIN + BTN_W + 4, y,
              cx - MARGIN * 2 - BTN_W - 4, BTN_H, TRUE);
+  y += ROW_H;
+
+  MoveWindow(GetDlgItem(g_hWnd, ID_STATIC_FILTER), MARGIN, y, FILTER_LABEL_W,
+             BTN_H, TRUE);
+  MoveWindow(GetDlgItem(g_hWnd, ID_EDIT_FILTER), MARGIN + FILTER_LABEL_W, y,
+             cx - MARGIN * 2 - FILTER_LABEL_W - NG_ONLY_W - 8, BTN_H, TRUE);
+  MoveWindow(GetDlgItem(g_hWnd, ID_CHECK_NGONLY),
+             cx - MARGIN - NG_ONLY_W, y, NG_ONLY_W, BTN_H, TRUE);
   y += ROW_H;
 
   int32_t listH = cy - y - BOTTOM - MARGIN;
@@ -1741,6 +1826,15 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
                    WS_CHILD | WS_VISIBLE | WS_BORDER | ES_READONLY |
                        ES_AUTOHSCROLL,
                    0, 0, 0, 0, hWnd, ControlId(ID_EDIT_FILEPATH), hi, nullptr);
+      CreateWindow(L"STATIC", L"絞り込み",
+                   WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, 0, 0, 0, 0, hWnd,
+                   ControlId(ID_STATIC_FILTER), hi, nullptr);
+      CreateWindow(L"EDIT", L"",
+                   WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0,
+                   0, hWnd, ControlId(ID_EDIT_FILTER), hi, nullptr);
+      CreateWindow(L"BUTTON", L"NGのみ",
+                   WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, hWnd,
+                   ControlId(ID_CHECK_NGONLY), hi, nullptr);
 
       g_hList = CreateWindow(
           WC_LISTVIEW, L"",
@@ -1796,6 +1890,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
       return 0;
 
     case WM_COMMAND:
+      if (LOWORD(wp) == ID_EDIT_FILTER && HIWORD(wp) == EN_CHANGE) {
+        if (g_hList)
+          ListViewPopulate();
+        return 0;
+      }
+      if (LOWORD(wp) == ID_CHECK_NGONLY && HIWORD(wp) == BN_CLICKED) {
+        if (g_hList)
+          ListViewPopulate();
+        return 0;
+      }
       switch (LOWORD(wp)) {
       case ID_BTN_OPEN:
         OnBtnOpen();
