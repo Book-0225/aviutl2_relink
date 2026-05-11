@@ -5,3 +5,7 @@ x64/
 aviutl2_relink/
 *.user
 *.aps
+aviutl2_sdk
+# AviUtl2 CLI
+/.aviutl2-cli
+/release

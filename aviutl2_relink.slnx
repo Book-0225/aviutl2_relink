@@ -3,4 +3,5 @@
     <Platform Name="x64" />
   </Configurations>
   <Project Path="aviutl2_relink.vcxproj" Id="278c254e-272d-4d68-aa1a-8f0d3b3950e6" />
+  <Project Path="aviutl2_relink_launcher.vcxproj" Id="7b0d6d35-4f4b-4f0f-ae3b-ff5d8f0a96f1" />
 </Solution>

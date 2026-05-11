@@ -284,3 +284,23 @@ CSVには、各参照ファイルの `result`、`action`、`source`、`destinati
 1. `git clone https://github.com/Book-0225/aviutl2_relink`
 2. `cd aviutl2_relink`
 3. `msbuild aviutl2_relink.vcxproj /p:Configuration=Release /p:Platform="x64"`
+
+### AviUtl2 汎用プラグインランチャー
+
+`aviutl2_relink_launcher.vcxproj` をビルドすると、AviUtl2 の編集メニューから
+`aviutl2_relink.exe` を起動するための汎用プラグイン
+`aviutl2_relink_launcher.aux2` が作成されます。
+
+```text
+msbuild aviutl2_relink_launcher.vcxproj /p:Configuration=Release /p:Platform="x64"
+```
+
+`aviutl2_relink_launcher.aux2` と `aviutl2_relink.exe` を同じフォルダに配置してください。
+AviUtl2 側で未保存の変更がある場合、外部ツールには最後に保存した `.aup2` の内容だけが表示されます。
+
+編集メニューには以下が追加されます。
+
+- `aviutl2_relink > 現在のプロジェクトを開く`
+- `aviutl2_relink > aup2 を選んで開く`
+- `aviutl2_relink > ツールだけ起動`
+- `aviutl2_relink > 配置フォルダを開く`

@@ -19,7 +19,7 @@
 #include <thread>
 #include <vector>
 
-constexpr wchar_t APP_TITLE_BASE[] = L"aviutl2_relink v0.0.4";
+constexpr wchar_t APP_TITLE_BASE[] = L"aviutl2_relink v0.0.5";
 constexpr wchar_t COPY_RULES_FILE[] = L"aviutl2_relink.copy.ini";
 
 constexpr int32_t ID_BTN_OPEN = 101;

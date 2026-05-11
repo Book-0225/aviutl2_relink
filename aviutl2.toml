@@ -1,0 +1,48 @@
+#:schema ./.aviutl2-cli/aviutl2.schema.json
+# 設定ファイルについては https://github.com/sevenc-nanashi/aviutl2-cli を参照してください。
+[project]
+id = "Book-0225.relink"
+name = "aviutl2_relink"
+version = "0.0.5"
+
+[build_group]
+debug_group = "msbuild aviutl2_relink.slnx /p:Configuration=Debug /p:Platform=x64"
+release_group = "msbuild aviutl2_relink.slnx /p:Configuration=Release /p:Platform=x64"
+
+[artifacts.relink_exe]
+enabled = true
+destination = "Plugin/aviutl2_relink.exe"
+
+[artifacts.relink_exe.profiles.debug]
+build = { group = "debug_group"}
+source = "x64/Debug/aviutl2_relink.exe"
+
+[artifacts.relink_exe.profiles.release]
+build = { group = "release_group"}
+source = "x64/Release/aviutl2_relink.exe"
+
+[artifacts.relink_launcher]
+enabled = true
+destination = "Plugin/aviutl2_relink_launcher.aux2"
+
+[artifacts.relink_launcher.profiles.debug]
+build = { group = "debug_group"}
+source = "x64/Debug/aviutl2_relink_launcher.aux2"
+
+[artifacts.relink_launcher.profiles.release]
+build = { group = "release_group"}
+source = "x64/Release/aviutl2_relink_launcher.aux2"
+
+[development]
+aviutl2_version = "latest"
+
+[preview]
+aviutl2_version = "latest"
+
+[release]
+output_dir = "release"
+package_template = "package.txt"
+zip_name = "{name}"
+profile = "release"
+package_name = "aviutl2_relink"
+package_information = "aviutl2_relink v0.0.5 by BOOK25"
