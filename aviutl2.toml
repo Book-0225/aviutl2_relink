@@ -3,7 +3,7 @@
 [project]
 id = "Book-0225.relink"
 name = "aviutl2_relink"
-version = "0.0.5"
+version = "0.0.6"
 
 [build_group]
 debug_group = "msbuild aviutl2_relink.slnx /p:Configuration=Debug /p:Platform=x64"
@@ -45,4 +45,4 @@ package_template = "package.txt"
 zip_name = "{name}"
 profile = "release"
 package_name = "aviutl2_relink"
-package_information = "aviutl2_relink v0.0.5 by BOOK25"
+package_information = "aviutl2_relink v0.0.6 by BOOK25"
