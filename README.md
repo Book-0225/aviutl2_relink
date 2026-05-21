@@ -310,4 +310,3 @@ AviUtl2 側で未保存の変更がある場合、外部ツールには最後に
 - `aviutl2_relink > 現在のプロジェクトを開く`
 - `aviutl2_relink > aup2 を選んで開く`
 - `aviutl2_relink > ツールだけ起動`
-- `aviutl2_relink > 配置フォルダを開く`
