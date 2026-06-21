@@ -1743,66 +1743,79 @@ static void StartCopyWorker(CopyPlan plan, bool copyAskItems,
         result->exportLog = exportLog;
         result->exportResult = exportResult;
         result->saveAfterUpdate = saveAfterUpdate;
+        try {
+            for (const auto& item : plan.items) {
+                CopyPlanItem record = item;
+                if (!item.exists) {
+                    record.result = L"missing";
+                    record.detail = L"source file not found";
+                    ++result->missing;
+                    result->records.push_back(std::move(record));
+                    continue;
+                }
+                if (item.action == CopyAction::Skip) {
+                    record.result = L"excluded";
+                    record.detail = L"skipped by rule";
+                    ++result->excluded;
+                    result->records.push_back(std::move(record));
+                    continue;
+                }
+                if (item.action == CopyAction::Ask && !copyAskItems) {
+                    record.result = L"ask_skipped";
+                    record.detail = L"ask items were not included";
+                    ++result->skippedAsk;
+                    result->records.push_back(std::move(record));
+                    continue;
+                }
+                if (item.destExists && !overwriteExisting) {
+                    record.result = L"existing_skipped";
+                    record.detail = L"destination already exists";
+                    ++result->skippedExisting;
+                    result->records.push_back(std::move(record));
+                    continue;
+                }
 
-        for (const auto& item : plan.items) {
-            CopyPlanItem record = item;
-            if (!item.exists) {
-                record.result = L"missing";
-                record.detail = L"source file not found";
-                ++result->missing;
-                result->records.push_back(std::move(record));
-                continue;
-            }
-            if (item.action == CopyAction::Skip) {
-                record.result = L"excluded";
-                record.detail = L"skipped by rule";
-                ++result->excluded;
-                result->records.push_back(std::move(record));
-                continue;
-            }
-            if (item.action == CopyAction::Ask && !copyAskItems) {
-                record.result = L"ask_skipped";
-                record.detail = L"ask items were not included";
-                ++result->skippedAsk;
-                result->records.push_back(std::move(record));
-                continue;
-            }
-            if (item.destExists && !overwriteExisting) {
-                record.result = L"existing_skipped";
-                record.detail = L"destination already exists";
-                ++result->skippedExisting;
-                result->records.push_back(std::move(record));
-                continue;
-            }
+                std::error_code ec;
+                std::filesystem::create_directories(item.dest.parent_path(), ec);
+                if (ec) {
+                    record.result = L"failed";
+                    record.detail = L"failed to create destination folder";
+                    ++result->failed;
+                    result->records.push_back(std::move(record));
+                    continue;
+                }
 
-            std::error_code ec;
-            std::filesystem::create_directories(item.dest.parent_path(), ec);
-            if (ec) {
-                record.result = L"failed";
-                record.detail = L"failed to create destination folder";
-                ++result->failed;
-                result->records.push_back(std::move(record));
-                continue;
-            }
+                auto options = overwriteExisting
+                                   ? std::filesystem::copy_options::overwrite_existing
+                                   : std::filesystem::copy_options::none;
+                std::filesystem::copy_file(item.source, item.dest, options, ec);
+                if (ec) {
+                    record.result = L"failed";
+                    record.detail = L"failed to copy file";
+                    ++result->failed;
+                    result->records.push_back(std::move(record));
+                    continue;
+                }
 
-            auto options = overwriteExisting
-                               ? std::filesystem::copy_options::overwrite_existing
-                               : std::filesystem::copy_options::none;
-            std::filesystem::copy_file(item.source, item.dest, options, ec);
-            if (ec) {
-                record.result = L"failed";
-                record.detail = L"failed to copy file";
-                ++result->failed;
+                record.result = L"copied";
+                record.detail = item.destExists ? L"overwritten" : L"";
+                ++result->copied;
+                result->copiedPaths[ToLower(
+                    NormalizePathForCompare(item.source).wstring())] =
+                    NormalizePathForCompare(item.dest);
                 result->records.push_back(std::move(record));
-                continue;
             }
-
-            record.result = L"copied";
-            record.detail = item.destExists ? L"overwritten" : L"";
-            ++result->copied;
-            result->copiedPaths[ToLower(
-                NormalizePathForCompare(item.source).wstring())] =
-                NormalizePathForCompare(item.dest);
+        } catch (const std::exception& e) {
+            CopyPlanItem record;
+            record.result = L"failed";
+            record.detail = L"unexpected error: " + ToWide(e.what());
+            ++result->failed;
+            result->records.push_back(std::move(record));
+        } catch (...) {
+            CopyPlanItem record;
+            record.result = L"failed";
+            record.detail = L"unexpected error";
+            ++result->failed;
             result->records.push_back(std::move(record));
         }
 
