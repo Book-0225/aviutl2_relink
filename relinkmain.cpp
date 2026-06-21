@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 constexpr wchar_t APP_TITLE_BASE[] = L"aviutl2_relink v0.0.7";
@@ -43,6 +44,9 @@ constexpr int32_t COL_STATUS = 0;
 constexpr int32_t COL_KEY = 1;
 constexpr int32_t COL_PATH = 2;
 constexpr uint32_t WM_COPYFILES_DONE = WM_APP + 1;
+constexpr uint32_t WM_CHECK_DONE = WM_APP + 2;
+constexpr uint32_t WM_ROOTSCAN_DONE = WM_APP + 3;
+constexpr uint32_t WM_COPYPLAN_DONE = WM_APP + 4;
 
 constexpr int32_t ID_SEL_LIST = 1001;
 
@@ -100,6 +104,11 @@ struct CopyPlan {
     std::vector<CopyPlanItem> items;
 };
 
+struct CopyPlanScanContext {
+    CopySettings settings;
+    CopyPlan plan;
+};
+
 struct CopyExecutionResult {
     std::filesystem::path destRoot;
     std::vector<CopyPlanItem> records;
@@ -140,10 +149,17 @@ static Aup2Document g_doc;
 static bool g_loaded = false;
 static bool g_dirty = false;
 static bool g_copyInProgress = false;
+static bool g_scanInProgress = false;
+static bool g_checkExportPending = false;
 static std::vector<CheckResult> g_checkResults;
+static std::unordered_map<const PathEntry*, bool> g_checkExistsByEntry;
 static std::vector<size_t> g_visibleEntries;
 static int32_t g_dpi = USER_DEFAULT_SCREEN_DPI;
 static HFONT g_hFont = nullptr;
+
+static bool IsBusy() {
+    return g_copyInProgress || g_scanInProgress;
+}
 
 static int32_t ScaleForDpi(int32_t value, int32_t dpi) {
     return MulDiv(value, dpi, USER_DEFAULT_SCREEN_DPI);
@@ -317,30 +333,25 @@ static void UpdateWindowTitle() {
     }
     if (g_copyInProgress)
         title += L" - コピー中";
+    else if (g_scanInProgress)
+        title += L" - 確認中";
     if (g_dirty)
         title += L" *";
     SetWindowText(g_hWnd, title.c_str());
 }
 
 static void UpdateControlStates() {
-    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_OPEN), !g_copyInProgress);
-    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_CHECK), g_loaded && !g_copyInProgress);
-    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_CHECKEXPORT),
-                 g_loaded && !g_copyInProgress);
-    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_EDITSEL),
-                 g_loaded && !g_copyInProgress);
-    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_REPLACEROOT),
-                 g_loaded && !g_copyInProgress);
-    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_RELINK_PROJECT_FILES),
-                 g_loaded && !g_copyInProgress);
-    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_COPYFILES),
-                 g_loaded && !g_copyInProgress);
-    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_SAVE),
-                 g_loaded && g_dirty && !g_copyInProgress);
-    EnableWindow(GetDlgItem(g_hWnd, ID_EDIT_FILTER),
-                 g_loaded && !g_copyInProgress);
-    EnableWindow(GetDlgItem(g_hWnd, ID_CHECK_NGONLY),
-                 g_loaded && !g_copyInProgress);
+    bool busy = IsBusy();
+    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_OPEN), !busy);
+    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_CHECK), g_loaded && !busy);
+    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_CHECKEXPORT), g_loaded && !busy);
+    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_EDITSEL), g_loaded && !busy);
+    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_REPLACEROOT), g_loaded && !busy);
+    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_RELINK_PROJECT_FILES), g_loaded && !busy);
+    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_COPYFILES), g_loaded && !busy);
+    EnableWindow(GetDlgItem(g_hWnd, ID_BTN_SAVE), g_loaded && g_dirty && !busy);
+    EnableWindow(GetDlgItem(g_hWnd, ID_EDIT_FILTER), g_loaded && !busy);
+    EnableWindow(GetDlgItem(g_hWnd, ID_CHECK_NGONLY), g_loaded && !busy);
 }
 
 static void SetDirty(bool dirty) {
@@ -511,15 +522,24 @@ static std::wstring GetControlText(HWND hwnd) {
     return text;
 }
 
-static bool IsEntryMissing(const PathEntry& entry) {
-    if (g_checkResults.empty())
-        return false;
+static void SetCheckResults(std::vector<CheckResult> results) {
+    g_checkResults = std::move(results);
+    g_checkExistsByEntry.clear();
+    g_checkExistsByEntry.reserve(g_checkResults.size());
+    for (const auto& r : g_checkResults)
+        g_checkExistsByEntry.emplace(r.entry, r.exists);
+}
 
-    for (const auto& result : g_checkResults) {
-        if (result.entry == &entry)
-            return !result.exists;
-    }
-    return false;
+static void ClearCheckResults() {
+    ClearCheckResults();
+    g_checkExistsByEntry.clear();
+}
+
+static bool IsEntryMissing(const PathEntry& entry) {
+    auto it = g_checkExistsByEntry.find(&entry);
+    if (it == g_checkExistsByEntry.end())
+        return false;
+    return !it->second;
 }
 
 static bool EntryMatchesCurrentFilter(const PathEntry& entry) {
@@ -1189,12 +1209,11 @@ static void ListViewPopulate() {
             continue;
 
         bool exists = false;
-        bool checked = !g_checkResults.empty();
-        for (const auto& r : g_checkResults) {
-            if (r.entry == &entry) {
-                exists = r.exists;
-                break;
-            }
+        bool checked = !g_checkExistsByEntry.empty();
+        if (checked) {
+            auto it = g_checkExistsByEntry.find(&entry);
+            if (it != g_checkExistsByEntry.end())
+                exists = it->second;
         }
 
         LVITEM lvi{};
@@ -1225,7 +1244,7 @@ static void OpenFile(const std::filesystem::path& path) {
     }
     g_doc = std::move(*result);
     g_loaded = true;
-    g_checkResults.clear();
+    ClearCheckResults();
     SetDirty(false);
 
     SetWindowText(GetDlgItem(g_hWnd, ID_EDIT_FILEPATH), g_doc.sourcePath.c_str());
@@ -1335,7 +1354,7 @@ static void OnBtnEditSel() {
         }
     }
 
-    g_checkResults.clear();
+    ClearCheckResults();
     SetDirty(true);
     ListViewPopulate();
 }
@@ -1516,7 +1535,7 @@ ShowMappingSelectionDialog(const std::vector<DetectedRootMapping>& mappings) {
 }
 
 static void OnBtnReplaceRoot() {
-    if (!g_loaded)
+    if (!g_loaded || IsBusy())
         return;
 
     std::filesystem::path suggestedDest;
@@ -1532,9 +1551,30 @@ static void OnBtnReplaceRoot() {
     if (!newRoot)
         return;
 
-    auto mappings = DetectRootMappings(*newRoot);
+    g_scanInProgress = true;
+    UpdateWindowTitle();
+    UpdateControlStates();
+    SetCursor(LoadCursor(nullptr, IDC_WAIT));
 
-    if (mappings.empty()) {
+    std::thread([newRoot = *newRoot]() {
+        auto* mappings = new std::vector<DetectedRootMapping>;
+        try {
+            *mappings = DetectRootMappings(newRoot);
+        } catch (...) {
+        }
+        if (!PostMessage(g_hWnd, WM_ROOTSCAN_DONE, 0, reinterpret_cast<LPARAM>(mappings)))
+            delete mappings;
+    }).detach();
+}
+
+static void FinishRootScan(std::vector<DetectedRootMapping>* mappingsPtr) {
+    std::unique_ptr<std::vector<DetectedRootMapping>> mappings(mappingsPtr);
+    g_scanInProgress = false;
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+    UpdateWindowTitle();
+    UpdateControlStates();
+
+    if (mappings->empty()) {
         TaskMsgBox(
             g_hWnd,
             L"指定フォルダ内に一致するファイル構造が見つかりませんでした。\n\n"
@@ -1544,16 +1584,15 @@ static void OnBtnReplaceRoot() {
     }
 
     int32_t selectedIndex = 0;
-    if (static_cast<int32_t>(mappings.size()) > 1) {
-        selectedIndex = ShowMappingSelectionDialog(mappings);
+    if (static_cast<int32_t>(mappings->size()) > 1) {
+        selectedIndex = ShowMappingSelectionDialog(*mappings);
         if (selectedIndex < 0)
             return;
     }
 
-    const DetectedRootMapping& chosen =
-        mappings[static_cast<size_t>(selectedIndex)];
+    const DetectedRootMapping& chosen = (*mappings)[static_cast<size_t>(selectedIndex)];
     auto normalizedOld = NormalizePathForCompare(chosen.oldRoot);
-    auto normalizedNew = NormalizePathForCompare(*newRoot);
+    auto normalizedNew = NormalizePathForCompare(chosen.newRoot);
     std::wstring oldRootText = normalizedOld.wstring();
     std::wstring newRootText = normalizedNew.wstring();
     std::wstring oldPrefix = EnsureTrailingSeparator(oldRootText);
@@ -1570,8 +1609,7 @@ static void OnBtnReplaceRoot() {
                     oldRootText, newRootText, chosen.matchCount,
                     chosen.totalEntries, unmatchedCount);
 
-    if (TaskMsgBox(g_hWnd, confirmMsg.c_str(), L"ルート一括置換",
-                   MB_YESNO | MB_ICONQUESTION) != IDYES)
+    if (TaskMsgBox(g_hWnd, confirmMsg, L"ルート一括置換", MB_YESNO | MB_ICONQUESTION) != IDYES)
         return;
 
     int32_t updated = 0;
@@ -1579,16 +1617,14 @@ static void OnBtnReplaceRoot() {
         if (entry.isProjectFile)
             continue;
 
-        std::wstring current =
-            NormalizePathForCompare(PathFromUtf8(entry.path)).wstring();
+        std::wstring current = NormalizePathForCompare(PathFromUtf8(entry.path)).wstring();
         std::wstring replaced;
-        if (PathsReferToSameLocation(current, oldRootText)) {
+        if (PathsReferToSameLocation(current, oldRootText))
             replaced = newRootText;
-        } else if (StartsWithPathPrefix(current, oldPrefix)) {
+        else if (StartsWithPathPrefix(current, oldPrefix))
             replaced = newPrefix + current.substr(oldPrefix.size());
-        } else {
+        else
             continue;
-        }
 
         std::string newPath = ToUtf8(replaced);
         if (entry.path == newPath)
@@ -1599,18 +1635,15 @@ static void OnBtnReplaceRoot() {
     }
 
     if (updated == 0) {
-        TaskMsgBox(g_hWnd, L"一致する参照パスはありませんでした。",
-                   L"ルート一括置換", MB_ICONINFORMATION);
+        TaskMsgBox(g_hWnd, L"一致する参照パスはありませんでした。", L"ルート一括置換", MB_ICONINFORMATION);
         return;
     }
 
-    g_checkResults.clear();
+    ClearCheckResults();
     SetDirty(true);
     ListViewPopulate();
 
-    TaskMsgBox(g_hWnd,
-               std::format(L"{} 件の参照パスを置換しました。", updated).c_str(),
-               L"ルート一括置換", MB_ICONINFORMATION);
+    TaskMsgBox(g_hWnd, std::format(L"{} 件の参照パスを置換しました。", updated), L"ルート一括置換", MB_ICONINFORMATION);
 }
 
 static void OnBtnRelinkProjectFiles() {
@@ -1710,7 +1743,7 @@ static void OnBtnRelinkProjectFiles() {
         item.entry->path = ToUtf8(item.newPath.wstring());
     }
 
-    g_checkResults.clear();
+    ClearCheckResults();
     SetDirty(true);
     ListViewPopulate();
 
@@ -1851,7 +1884,7 @@ static void FinishCopyFiles(CopyExecutionResult& result) {
     bool saveRequested = false;
     bool saved = false;
     if (updated > 0) {
-        g_checkResults.clear();
+        ClearCheckResults();
         SetDirty(true);
         ListViewPopulate();
         saveRequested = ResolveAskSetting(result.saveAfterUpdate,
@@ -1920,38 +1953,61 @@ static void FinishCopyFiles(CopyExecutionResult& result) {
 }
 
 static void OnBtnCopyFiles() {
-    if (!g_loaded)
+    if (!g_loaded || IsBusy())
         return;
 
     CopySettings settings = LoadCopySettings();
 
     std::filesystem::path destRoot;
-    std::wstring suggestedFolder =
-        ExpandProjectFolderTemplate(settings.projectSideFolder);
+    std::wstring suggestedFolder = ExpandProjectFolderTemplate(settings.projectSideFolder);
     auto projectSideDest = g_doc.sourcePath.parent_path() / suggestedFolder;
 
     std::wstring destMsg =
         L"プロジェクトファイル直下にコピー用フォルダを作成しますか？\n\n  " +
         projectSideDest.wstring() +
         L"\n\nいいえを選ぶと任意フォルダを指定できます。";
-    int32_t destChoice = TaskMsgBox(g_hWnd, destMsg.c_str(), L"素材コピー",
-                                    MB_YESNOCANCEL | MB_ICONQUESTION);
+    int32_t destChoice = TaskMsgBox(g_hWnd, destMsg, L"素材コピー", MB_YESNOCANCEL | MB_ICONQUESTION);
     if (destChoice == IDCANCEL)
         return;
     if (destChoice == IDYES) {
         destRoot = projectSideDest;
     } else {
-        auto picked = PickFolder(L"コピー先フォルダを選択してください",
-                                 g_doc.sourcePath.parent_path());
+        auto picked = PickFolder(L"コピー先フォルダを選択してください", g_doc.sourcePath.parent_path());
         if (!picked)
             return;
         destRoot = *picked;
     }
 
-    CopyPlan plan = BuildCopyPlan(settings, destRoot);
+    g_scanInProgress = true;
+    UpdateWindowTitle();
+    UpdateControlStates();
+    SetCursor(LoadCursor(nullptr, IDC_WAIT));
+
+    std::thread([settings, destRoot]() {
+        auto* ctx = new CopyPlanScanContext;
+        ctx->settings = settings;
+        try {
+            ctx->plan = BuildCopyPlan(settings, destRoot);
+        } catch (...) {
+        }
+        if (!PostMessage(g_hWnd, WM_COPYPLAN_DONE, 0, reinterpret_cast<LPARAM>(ctx)))
+            delete ctx;
+    }).detach();
+}
+
+static void FinishCopyPlanScan(CopyPlanScanContext* ctxPtr) {
+    std::unique_ptr<CopyPlanScanContext> ctx(ctxPtr);
+    g_scanInProgress = false;
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+    UpdateWindowTitle();
+    UpdateControlStates();
+
+    CopySettings& settings = ctx->settings;
+    CopyPlan& plan = ctx->plan;
+    const std::filesystem::path destRoot = plan.destRoot;
+
     if (plan.items.empty()) {
-        TaskMsgBox(g_hWnd, L"コピー候補になる参照ファイルがありません。",
-                   L"素材コピー", MB_ICONINFORMATION);
+        TaskMsgBox(g_hWnd, L"コピー候補になる参照ファイルがありません。", L"素材コピー", MB_ICONINFORMATION);
         return;
     }
 
@@ -1982,8 +2038,7 @@ static void OnBtnCopyFiles() {
                         L"これらもコピー対象に含めますか？",
                         askCount);
         askMsg += DescribeFirstItems(plan, CopyAction::Ask, 8);
-        int32_t askChoice = TaskMsgBox(g_hWnd, askMsg.c_str(), L"素材コピー",
-                                       MB_YESNOCANCEL | MB_ICONQUESTION);
+        int32_t askChoice = TaskMsgBox(g_hWnd, askMsg, L"素材コピー", MB_YESNOCANCEL | MB_ICONQUESTION);
         if (askChoice == IDCANCEL)
             return;
         copyAskItems = (askChoice == IDYES);
@@ -2001,9 +2056,7 @@ static void OnBtnCopyFiles() {
                             L"上書きしますか？\n\n"
                             L"いいえを選ぶと既存ファイルはスキップします。",
                             destExistsCount);
-            int32_t overwriteChoice =
-                TaskMsgBox(g_hWnd, overwriteMsg.c_str(), L"素材コピー",
-                           MB_YESNOCANCEL | MB_ICONWARNING);
+            int32_t overwriteChoice = TaskMsgBox(g_hWnd, overwriteMsg, L"素材コピー", MB_YESNOCANCEL | MB_ICONWARNING);
             if (overwriteChoice == IDCANCEL)
                 return;
             overwriteExisting = (overwriteChoice == IDYES);
@@ -2012,8 +2065,7 @@ static void OnBtnCopyFiles() {
 
     int32_t effectiveCopyCount = copyCount + (copyAskItems ? askCount : 0);
     if (effectiveCopyCount == 0) {
-        TaskMsgBox(g_hWnd, L"コピー対象がありません。", L"素材コピー",
-                   MB_ICONINFORMATION);
+        TaskMsgBox(g_hWnd, L"コピー対象がありません。", L"素材コピー", MB_ICONINFORMATION);
         return;
     }
 
@@ -2028,10 +2080,8 @@ static void OnBtnCopyFiles() {
         confirmMsg += DescribeFirstItems(plan, CopyAction::Skip, 5);
     }
 
-    if (TaskMsgBox(g_hWnd, confirmMsg.c_str(), L"素材コピー",
-                   MB_YESNO | MB_ICONQUESTION) != IDYES) {
+    if (TaskMsgBox(g_hWnd, confirmMsg, L"素材コピー", MB_YESNO | MB_ICONQUESTION) != IDYES)
         return;
-    }
 
     bool updatePaths = false;
     if (settings.updatePathsAfterCopy == UpdatePathsMode::Yes) {
@@ -2043,41 +2093,63 @@ static void OnBtnCopyFiles() {
         updatePaths = (updateChoice == IDYES);
     }
 
-    StartCopyWorker(std::move(plan), copyAskItems, overwriteExisting, updatePaths,
-                    settings.exportLog, settings.exportResult,
-                    settings.saveAfterUpdate);
+    StartCopyWorker(std::move(plan), copyAskItems, overwriteExisting, updatePaths, settings.exportLog, settings.exportResult, settings.saveAfterUpdate);
+}
+
+static void StartCheckScan(bool exportAfter) {
+    if (!g_loaded || IsBusy())
+        return;
+
+    g_checkExportPending = exportAfter;
+    g_scanInProgress = true;
+    UpdateWindowTitle();
+    UpdateControlStates();
+    SetCursor(LoadCursor(nullptr, IDC_WAIT));
+
+    std::thread([]() {
+        auto* results = new std::vector<CheckResult>;
+        try {
+            *results = CheckPaths(g_doc);
+        } catch (...) {
+        }
+        if (!PostMessage(g_hWnd, WM_CHECK_DONE, 0, reinterpret_cast<LPARAM>(results)))
+            delete results;
+    }).detach();
 }
 
 static void OnBtnCheck() {
-    if (!g_loaded)
-        return;
-    g_checkResults = CheckPaths(g_doc);
-    ListViewPopulate();
-
-    int32_t ng = 0;
-    for (const auto& r : g_checkResults)
-        if (!r.exists)
-            ++ng;
-    std::wstring resultMsg =
-        ng > 0 ? std::format(L"チェック完了: {} 件中 {} 件が見つかりません。",
-                             g_checkResults.size(), ng)
-               : std::format(L"チェック完了: {} 件すべて確認できました。",
-                             g_checkResults.size());
-    TaskMsgBox(g_hWnd, resultMsg.c_str(), L"チェック結果",
-               ng > 0 ? MB_ICONWARNING : MB_ICONINFORMATION);
+    StartCheckScan(false);
 }
 
 static void OnBtnCheckExport() {
-    if (!g_loaded)
-        return;
+    StartCheckScan(true);
+}
 
-    g_checkResults = CheckPaths(g_doc);
+static void FinishCheck(std::vector<CheckResult>* resultsPtr) {
+    std::unique_ptr<std::vector<CheckResult>> owned(resultsPtr);
+    g_scanInProgress = false;
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+
+    SetCheckResults(std::move(*owned));
     ListViewPopulate();
+    UpdateWindowTitle();
+    UpdateControlStates();
 
     int32_t ng = 0;
     for (const auto& r : g_checkResults)
         if (!r.exists)
             ++ng;
+
+    bool exportRequested = g_checkExportPending;
+    g_checkExportPending = false;
+
+    if (!exportRequested) {
+        std::wstring resultMsg =
+            ng > 0 ? std::format(L"チェック完了: {} 件中 {} 件が見つかりません。", g_checkResults.size(), ng)
+                   : std::format(L"チェック完了: {} 件すべて確認できました。", g_checkResults.size());
+        TaskMsgBox(g_hWnd, resultMsg, L"チェック結果", ng > 0 ? MB_ICONWARNING : MB_ICONINFORMATION);
+        return;
+    }
 
     std::wstring defaultName = g_doc.sourcePath.stem().wstring() + L"_check_" +
                                MakeTimestamp() + L".csv";
@@ -2096,7 +2168,7 @@ static void OnBtnCheckExport() {
         resultMsg += L"\n  ";
         resultMsg += exportPath->wstring();
     }
-    TaskMsgBox(g_hWnd, resultMsg.c_str(), L"チェック結果",
+    TaskMsgBox(g_hWnd, resultMsg, L"チェック結果",
                (!exported || ng > 0) ? MB_ICONWARNING : MB_ICONINFORMATION);
 }
 
@@ -2107,10 +2179,9 @@ static void OnBtnSave() {
 }
 
 static void OnDropFiles(HDROP hDrop) {
-    if (g_copyInProgress) {
+    if (IsBusy()) {
         DragFinish(hDrop);
-        TaskMsgBox(g_hWnd, L"素材コピーが完了するまでお待ちください。", L"確認",
-                   MB_ICONINFORMATION);
+        TaskMsgBox(g_hWnd, L"処理が完了するまでお待ちください。", L"確認", MB_ICONINFORMATION);
         return;
     }
 
@@ -2314,17 +2385,31 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
                 return 0;
 
             case WM_COPYFILES_DONE: {
-                std::unique_ptr<CopyExecutionResult> result(
-                    reinterpret_cast<CopyExecutionResult*>(lp));
+                std::unique_ptr<CopyExecutionResult> result(reinterpret_cast<CopyExecutionResult*>(lp));
                 if (result)
                     FinishCopyFiles(*result);
                 return 0;
             }
 
+            case WM_CHECK_DONE: {
+                FinishCheck(reinterpret_cast<std::vector<CheckResult>*>(lp));
+                return 0;
+            }
+
+            case WM_ROOTSCAN_DONE: {
+                FinishRootScan(
+                    reinterpret_cast<std::vector<DetectedRootMapping>*>(lp));
+                return 0;
+            }
+
+            case WM_COPYPLAN_DONE: {
+                FinishCopyPlanScan(reinterpret_cast<CopyPlanScanContext*>(lp));
+                return 0;
+            }
+
             case WM_CLOSE:
-                if (g_copyInProgress) {
-                    TaskMsgBox(hWnd, L"素材コピーが完了するまでお待ちください。", L"確認",
-                               MB_ICONINFORMATION);
+                if (IsBusy()) {
+                    TaskMsgBox(hWnd, L"処理が完了するまでお待ちください。", L"確認", MB_ICONINFORMATION);
                     return 0;
                 }
                 if (!ConfirmSaveIfDirty())
