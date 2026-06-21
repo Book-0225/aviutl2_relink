@@ -668,8 +668,14 @@ static CopySettings LoadCopySettings() {
     if (!std::filesystem::exists(configPath)) {
         if (WriteDefaultCopyRules(configPath)) {
             std::wstring msg = std::wstring(COPY_RULES_FILE) +
-                               L" を作成しました。\n必要に応じて編集できます。";
-            TaskMsgBox(g_hWnd, msg.c_str(), L"コピー設定", MB_ICONINFORMATION);
+                               L" を作成しました。\n必要に応じて編集できます。\n\n  " +
+                               configPath.wstring();
+            TaskMsgBox(g_hWnd, msg, L"コピー設定", MB_ICONINFORMATION);
+        } else {
+            std::wstring msg =
+                L"設定ファイルの作成に失敗しました。既定の動作で続行します。\n\n  " +
+                configPath.wstring();
+            TaskMsgBox(g_hWnd, msg, L"コピー設定", MB_ICONWARNING);
         }
     }
 
