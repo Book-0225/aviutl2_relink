@@ -954,6 +954,11 @@ static std::wstring MakeTimestamp() {
 
 static std::string CsvCell(const std::wstring& value) {
     std::string utf8 = ToUtf8(value);
+    if (!utf8.empty()) {
+        char c = utf8.front();
+        if (c == '=' || c == '+' || c == '-' || c == '@')
+            utf8.insert(utf8.begin(), '\'');
+    }
     bool quote = utf8.find_first_of(",\"\r\n") != std::string::npos;
     if (!quote)
         return utf8;
