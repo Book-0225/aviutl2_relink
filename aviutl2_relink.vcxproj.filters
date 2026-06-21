@@ -10,4 +10,7 @@
   <ItemGroup>
     <ResourceCompile Include="version.rc" />
   </ItemGroup>
+  <ItemGroup>
+    <Manifest Include="app.manifest" />
+  </ItemGroup>
 </Project>

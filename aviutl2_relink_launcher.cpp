@@ -15,7 +15,7 @@ namespace {
 
 constexpr wchar_t PLUGIN_NAME[] = L"aviutl2_relink launcher";
 constexpr wchar_t PLUGIN_INFORMATION[] =
-    L"aviutl2_relink launcher v0.0.6 by BOOK25";
+    L"aviutl2_relink launcher v0.0.7 by BOOK25";
 constexpr wchar_t MENU_OPEN_CURRENT[] =
     L"aviutl2_relink\\現在のプロジェクトを開く";
 constexpr wchar_t MENU_PICK_PROJECT[] = L"aviutl2_relink\\aup2 を選んで開く";

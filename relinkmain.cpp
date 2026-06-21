@@ -3,6 +3,7 @@
 #include "Aup2Parser.h"
 #include <windows.h>
 // clang-format on
+#include <Uxtheme.h>
 #include <algorithm>
 #include <chrono>
 #include <commctrl.h>
@@ -22,7 +23,7 @@
 #include <thread>
 #include <vector>
 
-constexpr wchar_t APP_TITLE_BASE[] = L"aviutl2_relink v0.0.6";
+constexpr wchar_t APP_TITLE_BASE[] = L"aviutl2_relink v0.0.7";
 constexpr wchar_t COPY_RULES_FILE[] = L"aviutl2_relink.copy.ini";
 
 constexpr int32_t ID_BTN_OPEN = 101;
@@ -141,6 +142,113 @@ static bool g_dirty = false;
 static bool g_copyInProgress = false;
 static std::vector<CheckResult> g_checkResults;
 static std::vector<size_t> g_visibleEntries;
+static int32_t g_dpi = USER_DEFAULT_SCREEN_DPI;
+static HFONT g_hFont = nullptr;
+
+static int32_t ScaleForDpi(int32_t value, int32_t dpi) {
+    return MulDiv(value, dpi, USER_DEFAULT_SCREEN_DPI);
+}
+
+static HFONT CreateUiFont(int32_t dpi) {
+    NONCLIENTMETRICS ncm{};
+    ncm.cbSize = sizeof(ncm);
+    if (!SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm,
+                                    0, dpi)) {
+        if (!SystemParametersInfo(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
+            return nullptr;
+    }
+    return CreateFontIndirect(&ncm.lfMessageFont);
+}
+
+static BOOL CALLBACK SetFontProc(HWND hwnd, LPARAM lParam) {
+    SendMessage(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(reinterpret_cast<HFONT>(lParam)), TRUE);
+    return TRUE;
+}
+
+static void ApplyFontToChildren() {
+    if (!g_hFont)
+        return;
+    SendMessage(g_hWnd, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFont), TRUE);
+    EnumChildWindows(g_hWnd, SetFontProc, reinterpret_cast<LPARAM>(g_hFont));
+}
+
+static int32_t TaskMsgBox(HWND owner, const std::wstring& text, const std::wstring& title, UINT mbFlags) {
+    std::wstring mainInstruction;
+    std::wstring content = text;
+    size_t splitPos = text.find(L"\n\n");
+    if (splitPos != std::wstring::npos) {
+        mainInstruction = text.substr(0, splitPos);
+        content = text.substr(splitPos + 2);
+    }
+
+    TASKDIALOGCONFIG cfg{};
+    cfg.cbSize = sizeof(cfg);
+    cfg.hwndParent = owner;
+    cfg.dwFlags = TDF_SIZE_TO_CONTENT | TDF_ALLOW_DIALOG_CANCELLATION;
+    cfg.pszWindowTitle = title.c_str();
+    cfg.pszMainInstruction = mainInstruction.empty() ? nullptr : mainInstruction.c_str();
+    cfg.pszContent = content.c_str();
+
+    switch (mbFlags & 0xF0) {
+        case MB_ICONERROR:
+            cfg.pszMainIcon = TD_ERROR_ICON;
+            break;
+        case MB_ICONWARNING:
+            cfg.pszMainIcon = TD_WARNING_ICON;
+            break;
+        case MB_ICONQUESTION:
+        case MB_ICONINFORMATION:
+            cfg.pszMainIcon = TD_INFORMATION_ICON;
+            break;
+        default:
+            break;
+    }
+
+    int32_t defaultButton = IDOK;
+    switch (mbFlags & 0x0F) {
+        case MB_YESNO:
+            cfg.dwCommonButtons = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON;
+            defaultButton = IDYES;
+            break;
+        case MB_YESNOCANCEL:
+            cfg.dwCommonButtons =
+                TDCBF_YES_BUTTON | TDCBF_NO_BUTTON | TDCBF_CANCEL_BUTTON;
+            defaultButton = IDYES;
+            break;
+        case MB_OKCANCEL:
+            cfg.dwCommonButtons = TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON;
+            defaultButton = IDOK;
+            break;
+        case MB_OK:
+        default:
+            cfg.dwCommonButtons = TDCBF_OK_BUTTON;
+            defaultButton = IDOK;
+            break;
+    }
+
+    switch (mbFlags & 0xF00) {
+        case MB_DEFBUTTON2:
+            if (cfg.dwCommonButtons & TDCBF_NO_BUTTON)
+                defaultButton = IDNO;
+            else if (cfg.dwCommonButtons & TDCBF_CANCEL_BUTTON)
+                defaultButton = IDCANCEL;
+            break;
+        case MB_DEFBUTTON3:
+            if (cfg.dwCommonButtons & TDCBF_CANCEL_BUTTON)
+                defaultButton = IDCANCEL;
+            break;
+        default:
+            break;
+    }
+    cfg.nDefaultButton = defaultButton;
+
+    int32_t pressedButton = IDCANCEL;
+    HRESULT hr = TaskDialogIndirect(&cfg, &pressedButton, nullptr, nullptr);
+    if (FAILED(hr))
+        return TaskMsgBox(owner, text.c_str(), title.c_str(), mbFlags);
+
+    return pressedButton;
+}
 
 static std::wstring ToWide(const std::string& s) {
     if (s.empty())
@@ -541,7 +649,7 @@ static CopySettings LoadCopySettings() {
         if (WriteDefaultCopyRules(configPath)) {
             std::wstring msg = std::wstring(COPY_RULES_FILE) +
                                L" を作成しました。\n必要に応じて編集できます。";
-            MessageBox(g_hWnd, msg.c_str(), L"コピー設定", MB_ICONINFORMATION);
+            TaskMsgBox(g_hWnd, msg.c_str(), L"コピー設定", MB_ICONINFORMATION);
         }
     }
 
@@ -830,7 +938,7 @@ static bool ResolveAskSetting(UpdatePathsMode mode, const std::wstring& message,
         return true;
     if (mode == UpdatePathsMode::No)
         return false;
-    return MessageBox(g_hWnd, message.c_str(), title.c_str(),
+    return TaskMsgBox(g_hWnd, message.c_str(), title.c_str(),
                       MB_YESNO | MB_ICONQUESTION) == IDYES;
 }
 
@@ -1036,19 +1144,19 @@ static bool SaveCurrentDocument() {
                 L"\n\nこのまま保存すると、外部で更新された内容を上書きする可能性があ"
                 L"ります。\n"
                 L"保存を続行しますか？";
-            if (MessageBox(g_hWnd, msg.c_str(), L"外部更新の検出",
+            if (TaskMsgBox(g_hWnd, msg.c_str(), L"外部更新の検出",
                            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
                 return false;
             }
         }
     }
     if (!SaveAup2(g_doc, g_doc.sourcePath)) {
-        MessageBox(g_hWnd, L"保存に失敗しました。", L"エラー", MB_ICONERROR);
+        TaskMsgBox(g_hWnd, L"保存に失敗しました。", L"エラー", MB_ICONERROR);
         return false;
     }
 
     SetDirty(false);
-    MessageBox(g_hWnd, L"保存しました。(バックアップ: .aup2.bak)", L"完了",
+    TaskMsgBox(g_hWnd, L"保存しました。(バックアップ: .aup2.bak)", L"完了",
                MB_ICONINFORMATION);
     return true;
 }
@@ -1057,7 +1165,7 @@ static bool ConfirmSaveIfDirty() {
     if (!g_loaded || !g_dirty)
         return true;
 
-    int32_t result = MessageBox(g_hWnd, L"未保存の変更があります。保存しますか？",
+    int32_t result = TaskMsgBox(g_hWnd, L"未保存の変更があります。保存しますか？",
                                 L"確認", MB_YESNOCANCEL | MB_ICONWARNING);
     if (result == IDCANCEL)
         return false;
@@ -1106,7 +1214,7 @@ static void ListViewPopulate() {
 static void OpenFile(const std::filesystem::path& path) {
     auto result = ParseAup2(path);
     if (!result) {
-        MessageBox(g_hWnd, L"ファイルの読み込みに失敗しました。", L"エラー",
+        TaskMsgBox(g_hWnd, L"ファイルの読み込みに失敗しました。", L"エラー",
                    MB_ICONERROR);
         return;
     }
@@ -1126,7 +1234,7 @@ static void OpenFile(const std::filesystem::path& path) {
                              L"  記録: ") +
                 ToWide(entry.path) + L"\n  実際: " + g_doc.sourcePath.wstring() +
                 L"\n\n保存時に現在のパスで上書きしますか？";
-            if (MessageBox(g_hWnd, msg.c_str(), L"パスの不一致",
+            if (TaskMsgBox(g_hWnd, msg.c_str(), L"パスの不一致",
                            MB_YESNO | MB_ICONWARNING) == IDYES) {
                 entry.path = ToUtf8(g_doc.sourcePath.wstring());
             }
@@ -1163,7 +1271,7 @@ static void OnBtnEditSel() {
     int32_t sel = ListView_GetNextItem(g_hList, -1, LVNI_SELECTED);
     PathEntry* selEntry = EntryFromVisibleRow(sel);
     if (!selEntry) {
-        MessageBox(g_hWnd, L"行を選択してください。", L"確認", MB_ICONINFORMATION);
+        TaskMsgBox(g_hWnd, L"行を選択してください。", L"確認", MB_ICONINFORMATION);
         return;
     }
 
@@ -1172,7 +1280,7 @@ static void OnBtnEditSel() {
     std::vector<WCHAR> buf(32768, L'\0');
     std::wstring initialPath = ToWide(oldPath);
     if (initialPath.size() >= buf.size()) {
-        MessageBox(g_hWnd, L"初期パスが長すぎるため開けません。", L"エラー",
+        TaskMsgBox(g_hWnd, L"初期パスが長すぎるため開けません。", L"エラー",
                    MB_ICONERROR);
         return;
     }
@@ -1207,7 +1315,7 @@ static void OnBtnEditSel() {
                         L"まとめて変更しますか？\n\n"
                         L"  元: {}\n  新: {}",
                         sameIndices.size(), ToWide(oldPath), ToWide(newPath));
-        updateAll = (MessageBox(g_hWnd, msg.c_str(), L"一括変更の確認",
+        updateAll = (TaskMsgBox(g_hWnd, msg.c_str(), L"一括変更の確認",
                                 MB_YESNO | MB_ICONQUESTION) == IDYES);
     }
 
@@ -1422,7 +1530,7 @@ static void OnBtnReplaceRoot() {
     auto mappings = DetectRootMappings(*newRoot);
 
     if (mappings.empty()) {
-        MessageBox(
+        TaskMsgBox(
             g_hWnd,
             L"指定フォルダ内に一致するファイル構造が見つかりませんでした。\n\n"
             L"ファイルが正しいフォルダにコピーされているか確認してください。",
@@ -1457,7 +1565,7 @@ static void OnBtnReplaceRoot() {
                     oldRootText, newRootText, chosen.matchCount,
                     chosen.totalEntries, unmatchedCount);
 
-    if (MessageBox(g_hWnd, confirmMsg.c_str(), L"ルート一括置換",
+    if (TaskMsgBox(g_hWnd, confirmMsg.c_str(), L"ルート一括置換",
                    MB_YESNO | MB_ICONQUESTION) != IDYES)
         return;
 
@@ -1486,7 +1594,7 @@ static void OnBtnReplaceRoot() {
     }
 
     if (updated == 0) {
-        MessageBox(g_hWnd, L"一致する参照パスはありませんでした。",
+        TaskMsgBox(g_hWnd, L"一致する参照パスはありませんでした。",
                    L"ルート一括置換", MB_ICONINFORMATION);
         return;
     }
@@ -1495,7 +1603,7 @@ static void OnBtnReplaceRoot() {
     SetDirty(true);
     ListViewPopulate();
 
-    MessageBox(g_hWnd,
+    TaskMsgBox(g_hWnd,
                std::format(L"{} 件の参照パスを置換しました。", updated).c_str(),
                L"ルート一括置換", MB_ICONINFORMATION);
 }
@@ -1514,7 +1622,7 @@ static void OnBtnRelinkProjectFiles() {
         std::wstring msg =
             L"プロジェクト直下の素材フォルダが見つかりません。\n\n  " +
             currentRoot.wstring() + L"\n\n別のフォルダを指定しますか？";
-        if (MessageBox(g_hWnd, msg.c_str(), L"直下素材へ再リンク",
+        if (TaskMsgBox(g_hWnd, msg.c_str(), L"直下素材へ再リンク",
                        MB_YESNO | MB_ICONQUESTION) != IDYES) {
             return;
         }
@@ -1565,7 +1673,7 @@ static void OnBtnRelinkProjectFiles() {
                                        L"素材フォルダの痕跡なし: {} 件\n"
                                        L"移動先にファイルなし: {} 件",
                                        alreadyCurrent, noTrace, missing);
-        MessageBox(g_hWnd, msg.c_str(), L"直下素材へ再リンク", MB_ICONINFORMATION);
+        TaskMsgBox(g_hWnd, msg.c_str(), L"直下素材へ再リンク", MB_ICONINFORMATION);
         return;
     }
 
@@ -1588,7 +1696,7 @@ static void OnBtnRelinkProjectFiles() {
     }
     confirmMsg += L"\n\n実行しますか？";
 
-    if (MessageBox(g_hWnd, confirmMsg.c_str(), L"直下素材へ再リンク",
+    if (TaskMsgBox(g_hWnd, confirmMsg.c_str(), L"直下素材へ再リンク",
                    MB_YESNO | MB_ICONWARNING) != IDYES) {
         return;
     }
@@ -1608,7 +1716,7 @@ static void OnBtnRelinkProjectFiles() {
         L"素材フォルダの痕跡なし: {} 件\n"
         L"移動先にファイルなし: {} 件",
         updated, currentRoot.wstring(), alreadyCurrent, noTrace, missing);
-    MessageBox(g_hWnd, msg.c_str(), L"直下素材へ再リンク", MB_ICONINFORMATION);
+    TaskMsgBox(g_hWnd, msg.c_str(), L"直下素材へ再リンク", MB_ICONINFORMATION);
 }
 
 static void StartCopyWorker(CopyPlan plan, bool copyAskItems,
@@ -1785,7 +1893,7 @@ static void FinishCopyFiles(CopyExecutionResult& result) {
         resultMsg += L"\n  ";
         resultMsg += path.wstring();
     }
-    MessageBox(g_hWnd, resultMsg.c_str(), L"素材コピー",
+    TaskMsgBox(g_hWnd, resultMsg.c_str(), L"素材コピー",
                (result.failed > 0 || (saveRequested && !saved) ||
                 (logRequested && !logExported) ||
                 (resultRequested && !resultExported))
@@ -1808,7 +1916,7 @@ static void OnBtnCopyFiles() {
         L"プロジェクトファイル直下にコピー用フォルダを作成しますか？\n\n  " +
         projectSideDest.wstring() +
         L"\n\nいいえを選ぶと任意フォルダを指定できます。";
-    int32_t destChoice = MessageBox(g_hWnd, destMsg.c_str(), L"素材コピー",
+    int32_t destChoice = TaskMsgBox(g_hWnd, destMsg.c_str(), L"素材コピー",
                                     MB_YESNOCANCEL | MB_ICONQUESTION);
     if (destChoice == IDCANCEL)
         return;
@@ -1824,7 +1932,7 @@ static void OnBtnCopyFiles() {
 
     CopyPlan plan = BuildCopyPlan(settings, destRoot);
     if (plan.items.empty()) {
-        MessageBox(g_hWnd, L"コピー候補になる参照ファイルがありません。",
+        TaskMsgBox(g_hWnd, L"コピー候補になる参照ファイルがありません。",
                    L"素材コピー", MB_ICONINFORMATION);
         return;
     }
@@ -1856,7 +1964,7 @@ static void OnBtnCopyFiles() {
                         L"これらもコピー対象に含めますか？",
                         askCount);
         askMsg += DescribeFirstItems(plan, CopyAction::Ask, 8);
-        int32_t askChoice = MessageBox(g_hWnd, askMsg.c_str(), L"素材コピー",
+        int32_t askChoice = TaskMsgBox(g_hWnd, askMsg.c_str(), L"素材コピー",
                                        MB_YESNOCANCEL | MB_ICONQUESTION);
         if (askChoice == IDCANCEL)
             return;
@@ -1876,7 +1984,7 @@ static void OnBtnCopyFiles() {
                             L"いいえを選ぶと既存ファイルはスキップします。",
                             destExistsCount);
             int32_t overwriteChoice =
-                MessageBox(g_hWnd, overwriteMsg.c_str(), L"素材コピー",
+                TaskMsgBox(g_hWnd, overwriteMsg.c_str(), L"素材コピー",
                            MB_YESNOCANCEL | MB_ICONWARNING);
             if (overwriteChoice == IDCANCEL)
                 return;
@@ -1886,7 +1994,7 @@ static void OnBtnCopyFiles() {
 
     int32_t effectiveCopyCount = copyCount + (copyAskItems ? askCount : 0);
     if (effectiveCopyCount == 0) {
-        MessageBox(g_hWnd, L"コピー対象がありません。", L"素材コピー",
+        TaskMsgBox(g_hWnd, L"コピー対象がありません。", L"素材コピー",
                    MB_ICONINFORMATION);
         return;
     }
@@ -1902,7 +2010,7 @@ static void OnBtnCopyFiles() {
         confirmMsg += DescribeFirstItems(plan, CopyAction::Skip, 5);
     }
 
-    if (MessageBox(g_hWnd, confirmMsg.c_str(), L"素材コピー",
+    if (TaskMsgBox(g_hWnd, confirmMsg.c_str(), L"素材コピー",
                    MB_YESNO | MB_ICONQUESTION) != IDYES) {
         return;
     }
@@ -1911,7 +2019,7 @@ static void OnBtnCopyFiles() {
     if (settings.updatePathsAfterCopy == UpdatePathsMode::Yes) {
         updatePaths = true;
     } else if (settings.updatePathsAfterCopy == UpdatePathsMode::Ask) {
-        int32_t updateChoice = MessageBox(
+        int32_t updateChoice = TaskMsgBox(
             g_hWnd, L"コピーに成功したファイルの参照パスをコピー先へ変更しますか？",
             L"素材コピー", MB_YESNO | MB_ICONQUESTION);
         updatePaths = (updateChoice == IDYES);
@@ -1937,7 +2045,7 @@ static void OnBtnCheck() {
                              g_checkResults.size(), ng)
                : std::format(L"チェック完了: {} 件すべて確認できました。",
                              g_checkResults.size());
-    MessageBox(g_hWnd, resultMsg.c_str(), L"チェック結果",
+    TaskMsgBox(g_hWnd, resultMsg.c_str(), L"チェック結果",
                ng > 0 ? MB_ICONWARNING : MB_ICONINFORMATION);
 }
 
@@ -1970,7 +2078,7 @@ static void OnBtnCheckExport() {
         resultMsg += L"\n  ";
         resultMsg += exportPath->wstring();
     }
-    MessageBox(g_hWnd, resultMsg.c_str(), L"チェック結果",
+    TaskMsgBox(g_hWnd, resultMsg.c_str(), L"チェック結果",
                (!exported || ng > 0) ? MB_ICONWARNING : MB_ICONINFORMATION);
 }
 
@@ -1983,7 +2091,7 @@ static void OnBtnSave() {
 static void OnDropFiles(HDROP hDrop) {
     if (g_copyInProgress) {
         DragFinish(hDrop);
-        MessageBox(g_hWnd, L"素材コピーが完了するまでお待ちください。", L"確認",
+        TaskMsgBox(g_hWnd, L"素材コピーが完了するまでお待ちください。", L"確認",
                    MB_ICONINFORMATION);
         return;
     }
@@ -2003,17 +2111,17 @@ static void OnDropFiles(HDROP hDrop) {
 }
 
 static void OnSize(int32_t cx, int32_t cy) {
-    constexpr int32_t MARGIN = 8;
-    constexpr int32_t BTN_W = 72;
-    constexpr int32_t MID_BTN_W = 128;
-    constexpr int32_t RELINK_BTN_W = 164;
-    constexpr int32_t COPY_BTN_W = 112;
-    constexpr int32_t CHECK_EXPORT_BTN_W = 152;
-    constexpr int32_t FILTER_LABEL_W = 64;
-    constexpr int32_t NG_ONLY_W = 96;
-    constexpr int32_t BTN_H = 24;
-    constexpr int32_t ROW_H = 32;
-    constexpr int32_t BOTTOM = 36;
+    const int32_t MARGIN = ScaleForDpi(8, g_dpi);
+    const int32_t BTN_W = ScaleForDpi(72, g_dpi);
+    const int32_t MID_BTN_W = ScaleForDpi(128, g_dpi);
+    const int32_t RELINK_BTN_W = ScaleForDpi(164, g_dpi);
+    const int32_t COPY_BTN_W = ScaleForDpi(112, g_dpi);
+    const int32_t CHECK_EXPORT_BTN_W = ScaleForDpi(152, g_dpi);
+    const int32_t FILTER_LABEL_W = ScaleForDpi(64, g_dpi);
+    const int32_t NG_ONLY_W = ScaleForDpi(96, g_dpi);
+    const int32_t BTN_H = ScaleForDpi(24, g_dpi);
+    const int32_t ROW_H = ScaleForDpi(32, g_dpi);
+    const int32_t BOTTOM = ScaleForDpi(36, g_dpi);
 
     int32_t y = MARGIN;
 
@@ -2061,6 +2169,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
             case WM_CREATE: {
                 g_hWnd = hWnd;
                 HINSTANCE hi = reinterpret_cast<CREATESTRUCT*>(lp)->hInstance;
+                g_dpi = GetDpiForWindow(hWnd);
+                g_hFont = CreateUiFont(g_dpi);
 
                 CreateWindow(L"BUTTON", L"開く", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0,
                              0, 0, 0, hWnd, ControlId(ID_BTN_OPEN), hi, nullptr);
@@ -2082,6 +2192,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
                                        WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT |
                                            LVS_SHOWSELALWAYS,
                                        0, 0, 0, 0, hWnd, ControlId(ID_LIST), hi, nullptr);
+                SetWindowTheme(g_hList, L"Explorer", nullptr);
                 ListView_SetExtendedListViewStyle(g_hList, LVS_EX_FULLROWSELECT |
                                                                LVS_EX_GRIDLINES);
 
@@ -2089,15 +2200,15 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
                 lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
                 lvc.iSubItem = COL_STATUS;
                 lvc.pszText = const_cast<LPWSTR>(L"状態");
-                lvc.cx = 48;
+                lvc.cx = ScaleForDpi(48, g_dpi);
                 ListView_InsertColumn(g_hList, COL_STATUS, &lvc);
                 lvc.iSubItem = COL_KEY;
                 lvc.pszText = const_cast<LPWSTR>(L"キー");
-                lvc.cx = 120;
+                lvc.cx = ScaleForDpi(120, g_dpi);
                 ListView_InsertColumn(g_hList, COL_KEY, &lvc);
                 lvc.iSubItem = COL_PATH;
                 lvc.pszText = const_cast<LPWSTR>(L"パス");
-                lvc.cx = 600;
+                lvc.cx = ScaleForDpi(600, g_dpi);
                 ListView_InsertColumn(g_hList, COL_PATH, &lvc);
 
                 CreateWindow(L"BUTTON", L"チェック",
@@ -2121,6 +2232,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
                              ControlId(ID_BTN_COPYFILES), hi, nullptr);
 
+                ApplyFontToChildren();
                 DragAcceptFiles(hWnd, TRUE);
                 UpdateWindowTitle();
                 UpdateControlStates();
@@ -2131,6 +2243,19 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
                 OnSize(LOWORD(lp), HIWORD(lp));
                 return 0;
 
+            case WM_DPICHANGED: {
+                g_dpi = HIWORD(wp);
+                HFONT newFont = CreateUiFont(g_dpi);
+                if (newFont) {
+                    if (g_hFont)
+                        DeleteObject(g_hFont);
+                    g_hFont = newFont;
+                    ApplyFontToChildren();
+                }
+                auto* suggested = reinterpret_cast<RECT*>(lp);
+                SetWindowPos(hWnd, nullptr, suggested->left, suggested->top, suggested->right - suggested->left, suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
+                return 0;
+            }
             case WM_COMMAND:
                 if (LOWORD(wp) == ID_EDIT_FILTER && HIWORD(wp) == EN_CHANGE) {
                     if (g_hList)
@@ -2180,7 +2305,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
 
             case WM_CLOSE:
                 if (g_copyInProgress) {
-                    MessageBox(hWnd, L"素材コピーが完了するまでお待ちください。", L"確認",
+                    TaskMsgBox(hWnd, L"素材コピーが完了するまでお待ちください。", L"確認",
                                MB_ICONINFORMATION);
                     return 0;
                 }
@@ -2194,6 +2319,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
                 return 0;
 
             case WM_DESTROY:
+                if (g_hFont) {
+                    DeleteObject(g_hFont);
+                    g_hFont = nullptr;
+                }
                 PostQuitMessage(0);
                 return 0;
         }
@@ -2202,7 +2331,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
         MessageBoxA(hWnd, e.what(), "予期しないエラー", MB_ICONERROR);
         return 0;
     } catch (...) {
-        MessageBox(hWnd, L"予期しないエラーが発生しました。", L"エラー",
+        TaskMsgBox(hWnd, L"予期しないエラーが発生しました。", L"エラー",
                    MB_ICONERROR);
         return 0;
     }
@@ -2224,9 +2353,14 @@ int32_t WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine,
     wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     RegisterClass(&wc);
 
+    int32_t startupDpi = GetDpiForSystem();
+    int32_t initialWidth = MulDiv(900, startupDpi, USER_DEFAULT_SCREEN_DPI);
+    int32_t initialHeight = MulDiv(600, startupDpi, USER_DEFAULT_SCREEN_DPI);
+
     HWND hWnd = CreateWindow(L"aviutl2_relink", APP_TITLE_BASE,
                              WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                             900, 600, nullptr, nullptr, hInstance, nullptr);
+                             initialWidth, initialHeight, nullptr, nullptr,
+                             hInstance, nullptr);
 
     ShowWindow(hWnd, nCmdShow);
     UpdateWindow(hWnd);

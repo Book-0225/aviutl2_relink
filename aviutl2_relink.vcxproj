@@ -20,6 +20,9 @@
   <ItemGroup>
     <ResourceCompile Include="version.rc" />
   </ItemGroup>
+  <ItemGroup>
+    <Manifest Include="app.manifest" />
+  </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>18.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
@@ -68,8 +71,14 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>comctl32.lib;comdlg32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>comctl32.lib;comdlg32.lib;uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <Manifest>
+      <AdditionalManifestFiles>app.manifest</AdditionalManifestFiles>
+    </Manifest>
+    <PreBuildEvent>
+      <Command>for %%f in ("$(ProjectDir)*.cpp" "$(ProjectDir)*.h") do clang-format -i "%%f"</Command>
+    </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -91,8 +100,14 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>comctl32.lib;comdlg32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>comctl32.lib;comdlg32.lib;uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <Manifest>
+      <AdditionalManifestFiles>app.manifest</AdditionalManifestFiles>
+    </Manifest>
+    <PreBuildEvent>
+      <Command>for %%f in ("$(ProjectDir)*.cpp" "$(ProjectDir)*.h") do clang-format -i "%%f"</Command>
+    </PreBuildEvent>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
