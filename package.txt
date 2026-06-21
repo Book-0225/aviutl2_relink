@@ -1,4 +1,4 @@
-[AviUtl ExEdit2 relink v0.0.6 by BOOK25]
+[AviUtl ExEdit2 relink v0.0.7 by BOOK25]
 ## 注意事項
 
 - 無保証です。自己責任で使用してください。

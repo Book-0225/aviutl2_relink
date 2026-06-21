@@ -3,7 +3,7 @@
 [project]
 id = "Book-0225.relink"
 name = "aviutl2_relink"
-version = "0.0.6"
+version = "0.0.7"
 
 [build_group]
 debug_group = "msbuild aviutl2_relink.slnx /p:Configuration=Debug /p:Platform=x64"
