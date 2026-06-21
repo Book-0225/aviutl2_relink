@@ -531,7 +531,7 @@ static void SetCheckResults(std::vector<CheckResult> results) {
 }
 
 static void ClearCheckResults() {
-    ClearCheckResults();
+    g_checkResults.clear();
     g_checkExistsByEntry.clear();
 }
 
