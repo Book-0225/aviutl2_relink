@@ -2328,6 +2328,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
 
+            case WM_GETMINMAXINFO: {
+                auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+                mmi->ptMinTrackSize.x = ScaleForDpi(640, g_dpi);
+                mmi->ptMinTrackSize.y = ScaleForDpi(420, g_dpi);
+                return 0;
+            }
+
             case WM_SIZE:
                 OnSize(LOWORD(lp), HIWORD(lp));
                 return 0;
