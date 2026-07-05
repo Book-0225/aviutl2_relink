@@ -3,7 +3,43 @@
 
 #include <fstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <windows.h>
+
+struct ObjectFrameInfo {
+    std::optional<int64_t> layer;
+    std::optional<int64_t> frameStart;
+    std::optional<int64_t> frameEnd;
+};
+
+static std::string TrimBoth(const std::string& s) {
+    size_t begin = s.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos)
+        return "";
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(begin, end - begin + 1);
+}
+
+static bool TryParseInt(const std::string& s, int64_t& out) {
+    std::string trimmed = TrimBoth(s);
+    if (trimmed.empty())
+        return false;
+    try {
+        size_t idx = 0;
+        int64_t v = std::stoll(trimmed, &idx);
+        if (idx != trimmed.size())
+            return false;
+        out = v;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static std::string TopLevelIdOf(const std::string& section) {
+    size_t dot = section.find('.');
+    return dot == std::string::npos ? section : section.substr(0, dot);
+}
 
 std::filesystem::path PathFromUtf8(const std::string& utf8) {
     return std::filesystem::path(reinterpret_cast<const char8_t*>(utf8.c_str()));
@@ -46,6 +82,9 @@ std::optional<Aup2Document> ParseAup2(const std::filesystem::path& path) {
 
     std::string line;
     bool inProjectSection = false;
+    std::string currentSection;
+    std::string currentEffectName;
+    std::unordered_map<std::string, ObjectFrameInfo> objectInfoByIndex;
 
     while (std::getline(ifs, line)) {
         if (!line.empty() && line.back() == '\r')
@@ -55,6 +94,13 @@ std::optional<Aup2Document> ParseAup2(const std::filesystem::path& path) {
         size_t lineno = doc.lines.size();
 
         if (!line.empty() && line.front() == '[') {
+            std::string header = line;
+            header.erase(0, 1);
+            if (!header.empty() && header.back() == ']')
+                header.pop_back();
+
+            currentSection = header;
+            currentEffectName.clear();
             inProjectSection = (line == "[project]");
             continue;
         }
@@ -66,6 +112,26 @@ std::optional<Aup2Document> ParseAup2(const std::filesystem::path& path) {
         std::string key = TrimRight(line.substr(0, eq));
         std::string value = TrimRight(line.substr(eq + 1));
 
+        if (key == "effect.name")
+            currentEffectName = value;
+
+        std::string topId = TopLevelIdOf(currentSection);
+        if (key == "layer") {
+            int64_t v;
+            if (TryParseInt(value, v))
+                objectInfoByIndex[topId].layer = v;
+        } else if (key == "frame") {
+            auto comma = value.find(',');
+            if (comma != std::string::npos) {
+                int64_t s, e;
+                if (TryParseInt(value.substr(0, comma), s) &&
+                    TryParseInt(value.substr(comma + 1), e)) {
+                    objectInfoByIndex[topId].frameStart = s;
+                    objectInfoByIndex[topId].frameEnd = e;
+                }
+            }
+        }
+
         if (!IsAbsolutePath(value))
             continue;
 
@@ -74,6 +140,13 @@ std::optional<Aup2Document> ParseAup2(const std::filesystem::path& path) {
 
         PathEntry entry;
         entry.lineno = lineno;
+        entry.section = currentSection;
+        entry.effectName = currentEffectName;
+        if (auto infoIt = objectInfoByIndex.find(topId); infoIt != objectInfoByIndex.end()) {
+            entry.layer = infoIt->second.layer;
+            entry.frameStart = infoIt->second.frameStart;
+            entry.frameEnd = infoIt->second.frameEnd;
+        }
         entry.key = key;
         entry.path = value;
         entry.isProjectFile = inProjectSection && (key == "file" || key == "File");

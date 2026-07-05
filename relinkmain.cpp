@@ -41,8 +41,12 @@ constexpr int32_t ID_EDIT_FILTER = 111;
 constexpr int32_t ID_CHECK_NGONLY = 112;
 constexpr int32_t ID_STATIC_FILTER = 113;
 constexpr int32_t COL_STATUS = 0;
-constexpr int32_t COL_KEY = 1;
-constexpr int32_t COL_PATH = 2;
+constexpr int32_t COL_LAYER = 1;
+constexpr int32_t COL_FRAME = 2;
+constexpr int32_t COL_LENGTH = 3;
+constexpr int32_t COL_EFFECT = 4;
+constexpr int32_t COL_KEY = 5;
+constexpr int32_t COL_PATH = 6;
 constexpr uint32_t WM_COPYFILES_DONE = WM_APP + 1;
 constexpr uint32_t WM_CHECK_DONE = WM_APP + 2;
 constexpr uint32_t WM_ROOTSCAN_DONE = WM_APP + 3;
@@ -556,8 +560,10 @@ static bool EntryMatchesCurrentFilter(const PathEntry& entry) {
 
     std::wstring key = ToLower(ToWide(entry.key));
     std::wstring path = ToLower(ToWide(entry.path));
+    std::wstring effectName = ToLower(ToWide(entry.effectName));
     return key.find(filter) != std::wstring::npos ||
-           path.find(filter) != std::wstring::npos;
+           path.find(filter) != std::wstring::npos ||
+           effectName.find(filter) != std::wstring::npos;
 }
 
 static PathEntry* EntryFromVisibleRow(int32_t row) {
@@ -1205,6 +1211,33 @@ static bool ConfirmSaveIfDirty() {
     return true;
 }
 
+static std::wstring DescribeEntrySection(const PathEntry& entry) {
+    std::wstring section = entry.section.empty() ? std::wstring()
+                                                 : (L"[" + ToWide(entry.section) + L"] ");
+    std::wstring effectName = ToWide(entry.effectName);
+    if (section.empty() && effectName.empty())
+        return L"-";
+    return section + effectName;
+}
+
+static std::wstring DescribeLayer(const PathEntry& entry) {
+    if (!entry.layer)
+        return L"-";
+    return std::format(L"{}", *entry.layer + 1);
+}
+
+static std::wstring DescribeFrameRange(const PathEntry& entry) {
+    if (!entry.frameStart || !entry.frameEnd)
+        return L"-";
+    return std::format(L"{}~{}", *entry.frameStart + 1, *entry.frameEnd + 1);
+}
+
+static std::wstring DescribeFrameLength(const PathEntry& entry) {
+    if (!entry.frameStart || !entry.frameEnd)
+        return L"-";
+    return std::format(L"{}", *entry.frameEnd - *entry.frameStart + 1);
+}
+
 static void ListViewPopulate() {
     ListView_DeleteAllItems(g_hList);
     g_visibleEntries.clear();
@@ -1230,6 +1263,18 @@ static void ListViewPopulate() {
         lvi.pszText = status.data();
         ListView_InsertItem(g_hList, &lvi);
         g_visibleEntries.push_back(i);
+
+        std::wstring layer = DescribeLayer(entry);
+        ListView_SetItemText(g_hList, lvi.iItem, COL_LAYER, layer.data());
+
+        std::wstring frame = DescribeFrameRange(entry);
+        ListView_SetItemText(g_hList, lvi.iItem, COL_FRAME, frame.data());
+
+        std::wstring length = DescribeFrameLength(entry);
+        ListView_SetItemText(g_hList, lvi.iItem, COL_LENGTH, length.data());
+
+        std::wstring effectLabel = DescribeEntrySection(entry);
+        ListView_SetItemText(g_hList, lvi.iItem, COL_EFFECT, effectLabel.data());
 
         std::wstring key = ToWide(entry.key);
         ListView_SetItemText(g_hList, lvi.iItem, COL_KEY, key.data());
@@ -1285,7 +1330,11 @@ static void OnBtnOpen() {
     OPENFILENAME ofn{};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = g_hWnd;
-    ofn.lpstrFilter = L"AviUtl2 Project (*.aup2)\0*.aup2\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFilter =
+        L"AviUtl2 Project/Alias (*.aup2;*.object)\0*.aup2;*.object\0"
+        L"AviUtl2 Project (*.aup2)\0*.aup2\0"
+        L"AviUtl2 Alias (*.object)\0*.object\0"
+        L"All Files (*.*)\0*.*\0";
     ofn.lpstrFile = buf.data();
     ofn.nMaxFile = static_cast<DWORD>(buf.size());
     ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
@@ -2297,13 +2346,29 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
                 lvc.pszText = const_cast<LPWSTR>(L"状態");
                 lvc.cx = ScaleForDpi(48, g_dpi);
                 ListView_InsertColumn(g_hList, COL_STATUS, &lvc);
+                lvc.iSubItem = COL_LAYER;
+                lvc.pszText = const_cast<LPWSTR>(L"レイヤ");
+                lvc.cx = ScaleForDpi(48, g_dpi);
+                ListView_InsertColumn(g_hList, COL_LAYER, &lvc);
+                lvc.iSubItem = COL_FRAME;
+                lvc.pszText = const_cast<LPWSTR>(L"フレーム範囲");
+                lvc.cx = ScaleForDpi(110, g_dpi);
+                ListView_InsertColumn(g_hList, COL_FRAME, &lvc);
+                lvc.iSubItem = COL_LENGTH;
+                lvc.pszText = const_cast<LPWSTR>(L"長さ");
+                lvc.cx = ScaleForDpi(56, g_dpi);
+                ListView_InsertColumn(g_hList, COL_LENGTH, &lvc);
+                lvc.iSubItem = COL_EFFECT;
+                lvc.pszText = const_cast<LPWSTR>(L"エフェクト");
+                lvc.cx = ScaleForDpi(180, g_dpi);
+                ListView_InsertColumn(g_hList, COL_EFFECT, &lvc);
                 lvc.iSubItem = COL_KEY;
                 lvc.pszText = const_cast<LPWSTR>(L"キー");
                 lvc.cx = ScaleForDpi(120, g_dpi);
                 ListView_InsertColumn(g_hList, COL_KEY, &lvc);
                 lvc.iSubItem = COL_PATH;
                 lvc.pszText = const_cast<LPWSTR>(L"パス");
-                lvc.cx = ScaleForDpi(600, g_dpi);
+                lvc.cx = ScaleForDpi(360, g_dpi);
                 ListView_InsertColumn(g_hList, COL_PATH, &lvc);
 
                 CreateWindow(L"BUTTON", L"チェック",

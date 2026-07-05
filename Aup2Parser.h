@@ -6,6 +6,11 @@
 
 struct PathEntry {
     size_t lineno;
+    std::string section;
+    std::string effectName;
+    std::optional<int64_t> layer;
+    std::optional<int64_t> frameStart;
+    std::optional<int64_t> frameEnd;
     std::string key;
     std::string path;
     bool isProjectFile;
