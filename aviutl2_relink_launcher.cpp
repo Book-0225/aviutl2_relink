@@ -15,7 +15,7 @@ namespace {
 
 constexpr wchar_t PLUGIN_NAME[] = L"aviutl2_relink launcher";
 constexpr wchar_t PLUGIN_INFORMATION[] =
-    L"aviutl2_relink launcher v0.0.7 by BOOK25";
+    L"aviutl2_relink launcher v0.0.8 by BOOK25";
 constexpr wchar_t MENU_OPEN_CURRENT[] =
     L"aviutl2_relink\\現在のプロジェクトを開く";
 constexpr wchar_t MENU_PICK_PROJECT[] = L"aviutl2_relink\\aup2 を選んで開く";
@@ -38,17 +38,17 @@ HWND OwnerWindow() {
 
 std::filesystem::path ModuleDirectory() {
     HMODULE module = nullptr;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCWSTR>(&g_commonPluginTable),
-                            &module)) {
+    if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&g_commonPluginTable),
+                           &module)) {
         return std::filesystem::current_path();
     }
 
     std::vector<wchar_t> buffer(MAX_PATH);
     for (;;) {
-        DWORD size = GetModuleFileNameW(module, buffer.data(),
-                                        static_cast<DWORD>(buffer.size()));
+        DWORD size = GetModuleFileName(module, buffer.data(),
+                                       static_cast<DWORD>(buffer.size()));
         if (size == 0)
             return std::filesystem::current_path();
         if (size + 1 < buffer.size())
@@ -88,7 +88,7 @@ PickProjectFile(HWND owner, const std::filesystem::path& initialFolder) {
     if (!initialFolderText.empty())
         ofn.lpstrInitialDir = initialFolderText.c_str();
 
-    if (!GetOpenFileNameW(&ofn))
+    if (!GetOpenFileName(&ofn))
         return std::nullopt;
 
     return std::filesystem::path(buffer.data());
@@ -130,7 +130,7 @@ bool LaunchRelink(const std::filesystem::path& exePath,
     std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
     mutableCommand.push_back(L'\0');
 
-    BOOL ok = CreateProcessW(
+    BOOL ok = CreateProcess(
         exePath.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE, 0,
         nullptr, exePath.parent_path().c_str(), &startupInfo, &processInfo);
     if (!ok)
@@ -142,10 +142,10 @@ bool LaunchRelink(const std::filesystem::path& exePath,
 }
 
 void ShowExeNotFound(HWND owner) {
-    MessageBoxW(owner,
-                L"aviutl2_relink.exe が見つかりません。\n"
-                L"このプラグインと同じフォルダに配置してください。",
-                PLUGIN_NAME, MB_ICONERROR);
+    MessageBox(owner,
+               L"aviutl2_relink.exe が見つかりません。\n"
+               L"このプラグインと同じフォルダに配置してください。",
+               PLUGIN_NAME, MB_ICONERROR);
 }
 
 std::optional<std::filesystem::path> CurrentProjectPath(EDIT_SECTION* edit) {
@@ -167,8 +167,8 @@ void OpenCurrentProject(EDIT_SECTION* edit) {
     HWND owner = OwnerWindow();
     auto projectPath = CurrentProjectPath(edit);
     if (!projectPath) {
-        MessageBoxW(owner, L"プロジェクトファイルを取得できませんでした。",
-                    PLUGIN_NAME, MB_ICONERROR);
+        MessageBox(owner, L"プロジェクトファイルを取得できませんでした。",
+                   PLUGIN_NAME, MB_ICONERROR);
         return;
     }
 
@@ -178,7 +178,7 @@ void OpenCurrentProject(EDIT_SECTION* edit) {
         return;
     }
 
-    int answer = MessageBoxW(
+    int answer = MessageBox(
         owner,
         L"aviutl2_relink.exe で現在のプロジェクトファイルを開きます。\n\n"
         L"AviUtl2 "
@@ -191,8 +191,8 @@ void OpenCurrentProject(EDIT_SECTION* edit) {
         return;
 
     if (!LaunchRelink(*exePath, projectPath)) {
-        MessageBoxW(owner, L"aviutl2_relink.exe の起動に失敗しました。",
-                    PLUGIN_NAME, MB_ICONERROR);
+        MessageBox(owner, L"aviutl2_relink.exe の起動に失敗しました。",
+                   PLUGIN_NAME, MB_ICONERROR);
     }
 }
 
@@ -213,8 +213,8 @@ void PickAndOpenProject(EDIT_SECTION* edit) {
         return;
 
     if (!LaunchRelink(*exePath, picked)) {
-        MessageBoxW(owner, L"aviutl2_relink.exe の起動に失敗しました。",
-                    PLUGIN_NAME, MB_ICONERROR);
+        MessageBox(owner, L"aviutl2_relink.exe の起動に失敗しました。",
+                   PLUGIN_NAME, MB_ICONERROR);
     }
 }
 
@@ -227,14 +227,14 @@ void OpenToolOnly(EDIT_SECTION*) {
     }
 
     if (!LaunchRelink(*exePath, std::nullopt)) {
-        MessageBoxW(owner, L"aviutl2_relink.exe の起動に失敗しました。",
-                    PLUGIN_NAME, MB_ICONERROR);
+        MessageBox(owner, L"aviutl2_relink.exe の起動に失敗しました。",
+                   PLUGIN_NAME, MB_ICONERROR);
     }
 }
 } // namespace
 
 EXTERN_C __declspec(dllexport) DWORD RequiredVersion() {
-    return 2004600;
+    return 2005301;
 }
 
 EXTERN_C __declspec(dllexport) COMMON_PLUGIN_TABLE* GetCommonPluginTable() {

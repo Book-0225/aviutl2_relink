@@ -4,6 +4,8 @@ AviUtl ExEdit2 のプロジェクトファイル (.aup2) が参照している�
 
 動画ファイルや素材ファイルを別のドライブやフォルダに移動したとき、プロジェクト内の参照パスをまとめて書き換えられます。
 
+エイリアスファイル(.object)でも使えます。
+
 ## 注意事項
 
 - 無保証です。自己責任で使用してください。  
@@ -29,7 +31,8 @@ AviUtl ExEdit2 のプロジェクトファイル (.aup2) が参照している�
 
 ## 使い方
 
-1. `aviutl2_relink.exe` を起動します
+1. `aviutl2_relink.exe` を起動します  
+  AviUtl2内の編集->プラグイン->aviutl2_relinkからも開けます
 2. 「開く」ボタンまたはドラッグ＆ドロップで `.aup2` ファイルを開きます
 3. 参照ファイルの一覧が表示されます
 
@@ -277,6 +280,41 @@ project_side_folder={project_name}_files
 CSVには、各参照ファイルの `result`、`action`、`source`、`destination`、`reason`、`detail` が出力されます。  
 出力先はコピー先フォルダで、ファイル名は `{project_name}_copy_YYYYMMDD_HHMMSS.csv` です。
 
+## 改版履歴
+
+- **v0.0.8**
+  - 見れる情報を追加
+  - .objectファイルに対応
+
+- **v0.0.7**
+  - 設定ファイルの作成エラー時のメッセージを追加
+  - ウィンドウサイズに最小値を追加
+  - 一部処理を非同期にしてUIが固まらないように変更
+  - コピー処理時のクラッシュを修正
+  - CSVを出力した際のインジェクション対策を追加
+  - UIを変更し高DPIに対応
+
+- **v0.0.6**
+  - 元ディレクトリが存在しなくても移動できるように変更
+
+- **v0.0.5**
+  - aux2のランチャーを同梱
+
+- **v0.0.4**
+  - 直下にコピーした素材の再リンク機能を追加
+
+- **v0.0.3**
+  - 結果の出力機能を追加
+  - 素材のコピー機能を追加
+
+- **v0.0.2**
+  - バッファオーバーランによってクラッシュする問題を修正
+  - 未保存の変更があるさいに確認を追加
+  - ディレクトリの一括置換を追加
+
+- **v0.0.1**
+  - 初版
+
 ## License
 
 このプロジェクトはMIT Licenseの下で公開されています
@@ -310,3 +348,35 @@ AviUtl2 側で未保存の変更がある場合、外部ツールには最後に
 - `aviutl2_relink > 現在のプロジェクトを開く`
 - `aviutl2_relink > aup2 を選んで開く`
 - `aviutl2_relink > ツールだけ起動`
+
+## Credits
+
+### AviUtl ExEdit2 Plugin SDK
+
+```
+---------------------------------
+AviUtl ExEdit2 Plugin SDK License
+---------------------------------
+
+The MIT License
+
+Copyright (c) 2025 Kenkun
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
