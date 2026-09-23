@@ -24,7 +24,7 @@
 #include <unordered_map>
 #include <vector>
 
-constexpr wchar_t APP_TITLE_BASE[] = L"aviutl2_relink v0.0.8";
+constexpr wchar_t APP_TITLE_BASE[] = L"aviutl2_relink v0.0.9";
 constexpr wchar_t COPY_RULES_FILE[] = L"aviutl2_relink.copy.ini";
 
 constexpr int32_t ID_BTN_OPEN = 101;
@@ -40,6 +40,9 @@ constexpr int32_t ID_BTN_RELINK_PROJECT_FILES = 110;
 constexpr int32_t ID_EDIT_FILTER = 111;
 constexpr int32_t ID_CHECK_NGONLY = 112;
 constexpr int32_t ID_STATIC_FILTER = 113;
+constexpr int32_t ID_CTXMENU_SHOW_IN_EXPLORER = 2001;
+constexpr int32_t ID_CTXMENU_COPY_PATH = 2002;
+constexpr int32_t ID_CTXMENU_OPEN_FILE = 2003;
 constexpr int32_t COL_STATUS = 0;
 constexpr int32_t COL_LAYER = 1;
 constexpr int32_t COL_FRAME = 2;
@@ -172,8 +175,7 @@ static int32_t ScaleForDpi(int32_t value, int32_t dpi) {
 static HFONT CreateUiFont(int32_t dpi) {
     NONCLIENTMETRICS ncm{};
     ncm.cbSize = sizeof(ncm);
-    if (!SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm,
-                                    0, dpi)) {
+    if (!SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0, dpi)) {
         if (!SystemParametersInfo(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
             return nullptr;
     }
@@ -274,16 +276,13 @@ static std::wstring ToWide(const std::string& s) {
     if (s.empty())
         return {};
 
-    int32_t n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(),
-                                    static_cast<int32_t>(s.size()), nullptr, 0);
+    int32_t n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int32_t>(s.size()), nullptr, 0);
     if (n <= 0)
         throw std::runtime_error("Failed to convert UTF-8 string to UTF-16.");
 
     std::wstring w(n, L'\0');
-    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(),
-                            static_cast<int32_t>(s.size()), w.data(), n) != n) {
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int32_t>(s.size()), w.data(), n) != n)
         throw std::runtime_error("Failed to convert UTF-8 string to UTF-16.");
-    }
     return w;
 }
 
@@ -291,22 +290,17 @@ static std::string ToUtf8(const std::wstring& w) {
     if (w.empty())
         return {};
 
-    int32_t n =
-        WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int32_t>(w.size()),
-                            nullptr, 0, nullptr, nullptr);
+    int32_t n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int32_t>(w.size()), nullptr, 0, nullptr, nullptr);
     if (n <= 0)
         throw std::runtime_error("Failed to convert UTF-16 string to UTF-8.");
 
     std::string s(n, '\0');
-    if (WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int32_t>(w.size()),
-                            s.data(), n, nullptr, nullptr) != n) {
+    if (WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int32_t>(w.size()), s.data(), n, nullptr, nullptr) != n)
         throw std::runtime_error("Failed to convert UTF-16 string to UTF-8.");
-    }
     return s;
 }
 
-static std::filesystem::path
-NormalizePathForCompare(const std::filesystem::path& path) {
+static std::filesystem::path NormalizePathForCompare(const std::filesystem::path& path) {
     std::error_code ec;
     auto normalized = path.lexically_normal();
 
@@ -317,8 +311,7 @@ NormalizePathForCompare(const std::filesystem::path& path) {
     return normalized;
 }
 
-static bool PathsReferToSameLocation(const std::filesystem::path& lhs,
-                                     const std::filesystem::path& rhs) {
+static bool PathsReferToSameLocation(const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
     auto left = NormalizePathForCompare(lhs).wstring();
     auto right = NormalizePathForCompare(rhs).wstring();
     return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) ==
@@ -372,8 +365,7 @@ static std::wstring EnsureTrailingSeparator(std::wstring path) {
     return path;
 }
 
-static bool StartsWithPathPrefix(const std::wstring& value,
-                                 const std::wstring& prefix) {
+static bool StartsWithPathPrefix(const std::wstring& value, const std::wstring& prefix) {
     if (value.size() < prefix.size())
         return false;
     return CompareStringOrdinal(
@@ -405,6 +397,65 @@ static bool EqualsIgnoreCase(const std::wstring& lhs, const std::wstring& rhs) {
            CSTR_EQUAL;
 }
 
+struct RunningAviUtl2Match {
+    std::wstring windowTitle;
+    std::wstring className;
+};
+
+namespace detail {
+struct AviUtl2WindowSearchCtx {
+    std::wstring fileNameLower;
+    std::wstring stemLower;
+    DWORD excludeProcessId = 0;
+    RunningAviUtl2Match match;
+    bool found = false;
+};
+
+BOOL CALLBACK Aup2WindowEnumProc(HWND hwnd, LPARAM lp) {
+    auto& ctx = *reinterpret_cast<AviUtl2WindowSearchCtx*>(lp);
+    if (!IsWindowVisible(hwnd))
+        return TRUE;
+    DWORD ownerProcessId = 0;
+    GetWindowThreadProcessId(hwnd, &ownerProcessId);
+    if (ownerProcessId == ctx.excludeProcessId)
+        return TRUE;
+    int32_t len = GetWindowTextLength(hwnd);
+    if (len <= 0)
+        return TRUE;
+    std::vector<wchar_t> buf(static_cast<size_t>(len) + 1);
+    GetWindowText(hwnd, buf.data(), static_cast<int32_t>(buf.size()));
+    std::wstring title(buf.data());
+    std::wstring titleLower = ToLower(Trim(title));
+    if (!ctx.fileNameLower.empty() && titleLower == ctx.fileNameLower) {
+        wchar_t className[256]{};
+        GetClassName(hwnd, className, 256);
+        ctx.match.windowTitle = title;
+        ctx.match.className = className;
+        ctx.found = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+} // namespace detail
+
+static bool FindPossibleAviUtl2Window(const std::filesystem::path& projectPath, RunningAviUtl2Match* outMatch) {
+    if (projectPath.empty())
+        return false;
+
+    detail::AviUtl2WindowSearchCtx ctx;
+    ctx.fileNameLower = ToLower(projectPath.filename().wstring());
+    ctx.stemLower = ToLower(projectPath.stem().wstring());
+    ctx.excludeProcessId = GetCurrentProcessId();
+    if (ctx.fileNameLower.empty() && ctx.stemLower.empty())
+        return false;
+
+    EnumWindows(detail::Aup2WindowEnumProc, reinterpret_cast<LPARAM>(&ctx));
+
+    if (ctx.found && outMatch)
+        *outMatch = ctx.match;
+    return ctx.found;
+}
+
 static std::optional<CopyAction> ParseCopyAction(const std::wstring& value) {
     auto v = ToLower(Trim(value));
     if (v == L"copy")
@@ -416,8 +467,7 @@ static std::optional<CopyAction> ParseCopyAction(const std::wstring& value) {
     return std::nullopt;
 }
 
-static std::optional<PreserveTreeMode>
-ParsePreserveTreeMode(const std::wstring& value) {
+static std::optional<PreserveTreeMode> ParsePreserveTreeMode(const std::wstring& value) {
     auto v = ToLower(Trim(value));
     if (v == L"flat")
         return PreserveTreeMode::Flat;
@@ -428,8 +478,7 @@ ParsePreserveTreeMode(const std::wstring& value) {
     return std::nullopt;
 }
 
-static std::optional<UpdatePathsMode>
-ParseUpdatePathsMode(const std::wstring& value) {
+static std::optional<UpdatePathsMode> ParseUpdatePathsMode(const std::wstring& value) {
     auto v = ToLower(Trim(value));
     if (v == L"ask")
         return UpdatePathsMode::Ask;
@@ -440,8 +489,7 @@ ParseUpdatePathsMode(const std::wstring& value) {
     return std::nullopt;
 }
 
-static std::optional<OverwriteMode>
-ParseOverwriteMode(const std::wstring& value) {
+static std::optional<OverwriteMode> ParseOverwriteMode(const std::wstring& value) {
     auto v = ToLower(Trim(value));
     if (v == L"ask")
         return OverwriteMode::Ask;
@@ -500,16 +548,14 @@ static bool WildcardMatch(const wchar_t* pattern, const wchar_t* text) {
     return *text == L'\0';
 }
 
-static bool PatternMatchesPath(const std::wstring& pattern,
-                               const std::filesystem::path& path) {
+static bool PatternMatchesPath(const std::wstring& pattern, const std::filesystem::path& path) {
     std::wstring normalizedPattern = NormalizeSlashes(Trim(pattern));
     if (normalizedPattern.empty())
         return false;
 
     std::wstring full = NormalizeSlashes(path.lexically_normal().wstring());
     std::wstring filename = NormalizeSlashes(path.filename().wstring());
-    bool pathPattern = normalizedPattern.find(L'/') != std::wstring::npos ||
-                       normalizedPattern.find(L':') != std::wstring::npos;
+    bool pathPattern = normalizedPattern.find(L'/') != std::wstring::npos || normalizedPattern.find(L':') != std::wstring::npos;
 
     const std::wstring& target = pathPattern ? full : filename;
     return WildcardMatch(normalizedPattern.c_str(), target.c_str());
@@ -574,6 +620,125 @@ static PathEntry* EntryFromVisibleRow(int32_t row) {
     if (entryIndex >= g_doc.entries.size())
         return nullptr;
     return &g_doc.entries[entryIndex];
+}
+
+static std::filesystem::path ResolveEntryPath(const PathEntry& entry) {
+    std::filesystem::path path = PathFromUtf8(entry.path);
+    if (path.is_absolute())
+        return path;
+    std::error_code ec;
+    std::filesystem::path resolved = g_doc.sourcePath.parent_path() / path;
+    if (std::filesystem::exists(resolved, ec))
+        return resolved;
+    return path;
+}
+
+static void CopyTextToClipboard(HWND owner, const std::wstring& text) {
+    if (!OpenClipboard(owner))
+        return;
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (hMem) {
+        void* dst = GlobalLock(hMem);
+        if (dst) {
+            memcpy(dst, text.c_str(), bytes);
+            GlobalUnlock(hMem);
+            if (!SetClipboardData(CF_UNICODETEXT, hMem))
+                GlobalFree(hMem);
+        } else {
+            GlobalFree(hMem);
+        }
+    }
+    CloseClipboard();
+}
+
+static void ShowPathInExplorer(const std::filesystem::path& path) {
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec)) {
+        std::wstring param = L"/select,\"" + path.wstring() + L"\"";
+        ShellExecute(g_hWnd, L"open", L"explorer.exe", param.c_str(), nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    std::filesystem::path parent = path.parent_path();
+    if (!parent.empty() && std::filesystem::exists(parent, ec)) {
+        ShellExecute(g_hWnd, L"open", L"explorer.exe", parent.wstring().c_str(), nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    TaskMsgBox(g_hWnd, L"フォルダーが見つかりません。\n\n" + path.wstring(), L"エクスプローラーで表示", MB_ICONWARNING);
+}
+
+static void OpenPathWithDefaultApp(const std::filesystem::path& path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        TaskMsgBox(g_hWnd, L"ファイルが見つかりません。\n\n" + path.wstring(), L"ファイルを開く", MB_ICONWARNING);
+        return;
+    }
+    HINSTANCE result = ShellExecute(g_hWnd, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(result) <= 32)
+        TaskMsgBox(g_hWnd, L"ファイルを開けませんでした。\n\n" + path.wstring(), L"ファイルを開く", MB_ICONERROR);
+}
+
+static void ShowListContextMenu(HWND hWnd, int32_t screenX, int32_t screenY) {
+    if (!g_hList)
+        return;
+
+    POINT pt{ screenX, screenY };
+    int32_t row = -1;
+    const bool fromKeyboard = (screenX == -1 && screenY == -1);
+
+    if (fromKeyboard) {
+        row = ListView_GetNextItem(g_hList, -1, LVNI_FOCUSED);
+        if (row < 0)
+            row = ListView_GetNextItem(g_hList, -1, LVNI_SELECTED);
+        RECT rc{};
+        if (row >= 0 && ListView_GetItemRect(g_hList, row, &rc, LVIR_BOUNDS)) {
+            pt.x = rc.left + ScaleForDpi(16, g_dpi);
+            pt.y = rc.top + (rc.bottom - rc.top) / 2;
+        } else {
+            pt.x = 0;
+            pt.y = 0;
+        }
+        ClientToScreen(g_hList, &pt);
+    } else {
+        POINT client = pt;
+        ScreenToClient(g_hList, &client);
+        LVHITTESTINFO hit{};
+        hit.pt = client;
+        row = ListView_HitTest(g_hList, &hit);
+        if (row < 0 || !(hit.flags & LVHT_ONITEM))
+            return;
+        if (!(ListView_GetItemState(g_hList, row, LVIS_SELECTED) & LVIS_SELECTED)) {
+            ListView_SetItemState(g_hList, -1, 0, LVIS_SELECTED);
+            ListView_SetItemState(g_hList, row, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        }
+    }
+
+    PathEntry* entry = EntryFromVisibleRow(row);
+    if (!entry)
+        return;
+    const std::filesystem::path path = ResolveEntryPath(*entry);
+    HMENU menu = CreatePopupMenu();
+    if (!menu)
+        return;
+    AppendMenu(menu, MF_STRING, ID_CTXMENU_SHOW_IN_EXPLORER, L"エクスプローラーで表示");
+    AppendMenu(menu, MF_STRING, ID_CTXMENU_COPY_PATH, L"パスをコピー");
+    AppendMenu(menu, MF_STRING, ID_CTXMENU_OPEN_FILE, L"ファイルを開く");
+
+    const int32_t cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, 0, hWnd, nullptr);
+    DestroyMenu(menu);
+
+    switch (cmd) {
+        case ID_CTXMENU_SHOW_IN_EXPLORER:
+            ShowPathInExplorer(path);
+            break;
+        case ID_CTXMENU_COPY_PATH:
+            CopyTextToClipboard(hWnd, path.wstring());
+            break;
+        case ID_CTXMENU_OPEN_FILE:
+            OpenPathWithDefaultApp(path);
+            break;
+    }
 }
 
 static std::filesystem::path GetExeDirectory() {
@@ -747,8 +912,7 @@ static CopySettings LoadCopySettings() {
     return settings;
 }
 
-static CopyCandidate ClassifyCopyCandidate(const std::filesystem::path& source,
-                                           const CopySettings& settings) {
+static CopyCandidate ClassifyCopyCandidate(const std::filesystem::path& source, const CopySettings& settings) {
     CopyCandidate candidate;
     candidate.source = source;
     candidate.action = settings.defaultAction;
@@ -778,9 +942,7 @@ static std::wstring SanitizePathPart(std::wstring value) {
     return value;
 }
 
-static std::filesystem::path
-RelativePathForCopy(const std::filesystem::path& source, PreserveTreeMode mode,
-                    const std::filesystem::path& commonRoot) {
+static std::filesystem::path RelativePathForCopy(const std::filesystem::path& source, PreserveTreeMode mode, const std::filesystem::path& commonRoot) {
     if (mode == PreserveTreeMode::Flat)
         return source.filename();
 
@@ -805,9 +967,7 @@ RelativePathForCopy(const std::filesystem::path& source, PreserveTreeMode mode,
     return result;
 }
 
-static std::optional<std::filesystem::path>
-RelativePathAfterFolder(const std::filesystem::path& path,
-                        const std::wstring& folderName) {
+static std::optional<std::filesystem::path> RelativePathAfterFolder(const std::filesystem::path& path, const std::wstring& folderName) {
     if (folderName.empty())
         return std::nullopt;
 
@@ -833,8 +993,7 @@ RelativePathAfterFolder(const std::filesystem::path& path,
     return relative;
 }
 
-static std::filesystem::path
-ComputeCommonRoot(const std::vector<CopyCandidate>& candidates) {
+static std::filesystem::path ComputeCommonRoot(const std::vector<CopyCandidate>& candidates) {
     std::filesystem::path common;
     for (const auto& candidate : candidates) {
         if (!candidate.exists || candidate.action == CopyAction::Skip)
@@ -865,8 +1024,7 @@ ComputeCommonRoot(const std::vector<CopyCandidate>& candidates) {
     return common;
 }
 
-static std::vector<CopyCandidate>
-BuildCopyCandidates(const CopySettings& settings) {
+static std::vector<CopyCandidate> BuildCopyCandidates(const CopySettings& settings) {
     std::vector<CopyCandidate> candidates;
     std::vector<std::wstring> seen;
 
@@ -894,8 +1052,7 @@ BuildCopyCandidates(const CopySettings& settings) {
     return candidates;
 }
 
-static CopyPlan BuildCopyPlan(const CopySettings& settings,
-                              const std::filesystem::path& destRoot) {
+static CopyPlan BuildCopyPlan(const CopySettings& settings, const std::filesystem::path& destRoot) {
     CopyPlan plan;
     plan.destRoot = destRoot;
     auto candidates = BuildCopyCandidates(settings);
@@ -909,8 +1066,7 @@ static CopyPlan BuildCopyPlan(const CopySettings& settings,
         item.reason = candidate.reason;
         item.exists = candidate.exists;
 
-        auto relative = RelativePathForCopy(candidate.source, settings.preserveTree,
-                                            commonRoot);
+        auto relative = RelativePathForCopy(candidate.source, settings.preserveTree, commonRoot);
         item.dest = destRoot / relative;
 
         std::wstring destKey = ToLower(item.dest.lexically_normal().wstring());
@@ -931,8 +1087,7 @@ static CopyPlan BuildCopyPlan(const CopySettings& settings,
     return plan;
 }
 
-static std::wstring DescribeFirstItems(const CopyPlan& plan, CopyAction action,
-                                       int32_t maxItems) {
+static std::wstring DescribeFirstItems(const CopyPlan& plan, CopyAction action, int32_t maxItems) {
     std::wstring text;
     int32_t count = 0;
     for (const auto& item : plan.items) {
@@ -964,14 +1119,12 @@ static std::wstring CopyActionName(CopyAction action) {
     return L"unknown";
 }
 
-static bool ResolveAskSetting(UpdatePathsMode mode, const std::wstring& message,
-                              const std::wstring& title) {
+static bool ResolveAskSetting(UpdatePathsMode mode, const std::wstring& message, const std::wstring& title) {
     if (mode == UpdatePathsMode::Yes)
         return true;
     if (mode == UpdatePathsMode::No)
         return false;
-    return TaskMsgBox(g_hWnd, message.c_str(), title.c_str(),
-                      MB_YESNO | MB_ICONQUESTION) == IDYES;
+    return TaskMsgBox(g_hWnd, message.c_str(), title.c_str(), MB_YESNO | MB_ICONQUESTION) == IDYES;
 }
 
 static std::wstring MakeTimestamp() {
@@ -979,9 +1132,7 @@ static std::wstring MakeTimestamp() {
     std::time_t t = std::chrono::system_clock::to_time_t(now);
     std::tm local{};
     localtime_s(&local, &t);
-    return std::format(L"{:04}{:02}{:02}_{:02}{:02}{:02}", local.tm_year + 1900,
-                       local.tm_mon + 1, local.tm_mday, local.tm_hour,
-                       local.tm_min, local.tm_sec);
+    return std::format(L"{:04}{:02}{:02}_{:02}{:02}{:02}", local.tm_year + 1900, local.tm_mon + 1, local.tm_mday, local.tm_hour, local.tm_min, local.tm_sec);
 }
 
 static std::string CsvCell(const std::wstring& value) {
@@ -1006,8 +1157,7 @@ static std::string CsvCell(const std::wstring& value) {
     return out;
 }
 
-static bool WriteTextUtf8(const std::filesystem::path& path,
-                          const std::wstring& text) {
+static bool WriteTextUtf8(const std::filesystem::path& path, const std::wstring& text) {
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs)
         return false;
@@ -1016,9 +1166,7 @@ static bool WriteTextUtf8(const std::filesystem::path& path,
     return ofs.good();
 }
 
-static bool WriteCopyLog(const CopyExecutionResult& result,
-                         const std::filesystem::path& path, int32_t updated,
-                         bool saved) {
+static bool WriteCopyLog(const CopyExecutionResult& result, const std::filesystem::path& path, int32_t updated, bool saved) {
     std::wstring text;
     text += L"aviutl2_relink copy log\n";
     text += L"timestamp: " + MakeTimestamp() + L"\n";
@@ -1051,8 +1199,7 @@ static bool WriteCopyLog(const CopyExecutionResult& result,
     return WriteTextUtf8(path, text);
 }
 
-static bool WriteCopyResultCsv(const CopyExecutionResult& result,
-                               const std::filesystem::path& path) {
+static bool WriteCopyResultCsv(const CopyExecutionResult& result, const std::filesystem::path& path) {
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs)
         return false;
@@ -1068,9 +1215,7 @@ static bool WriteCopyResultCsv(const CopyExecutionResult& result,
     return ofs.good();
 }
 
-static bool WriteCheckResultCsv(const Aup2Document& doc,
-                                const std::vector<CheckResult>& results,
-                                const std::filesystem::path& path) {
+static bool WriteCheckResultCsv(const Aup2Document& doc, const std::vector<CheckResult>& results, const std::filesystem::path& path) {
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs)
         return false;
@@ -1091,27 +1236,22 @@ static bool WriteCheckResultCsv(const Aup2Document& doc,
     return ofs.good();
 }
 
-static std::optional<std::filesystem::path>
-PickFolder(const std::wstring& title,
-           const std::filesystem::path& initialFolder = {}) {
+static std::optional<std::filesystem::path> PickFolder(const std::wstring& title, const std::filesystem::path& initialFolder = {}) {
     IFileDialog* dialog = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
-                                  CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
     if (FAILED(hr))
         return std::nullopt;
 
     DWORD options = 0;
     hr = dialog->GetOptions(&options);
     if (SUCCEEDED(hr)) {
-        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM |
-                           FOS_PATHMUSTEXIST);
+        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
     }
     dialog->SetTitle(title.c_str());
 
     if (!initialFolder.empty()) {
         IShellItem* folderItem = nullptr;
-        hr = SHCreateItemFromParsingName(initialFolder.c_str(), nullptr,
-                                         IID_PPV_ARGS(&folderItem));
+        hr = SHCreateItemFromParsingName(initialFolder.c_str(), nullptr, IID_PPV_ARGS(&folderItem));
         if (SUCCEEDED(hr)) {
             dialog->SetFolder(folderItem);
             folderItem->Release();
@@ -1141,10 +1281,7 @@ PickFolder(const std::wstring& title,
     return selected;
 }
 
-static std::optional<std::filesystem::path>
-PickSavePath(const std::wstring& title, const std::wstring& filter,
-             const std::filesystem::path& initialFolder,
-             const std::wstring& defaultFileName, const wchar_t* defaultExt) {
+static std::optional<std::filesystem::path> PickSavePath(const std::wstring& title, const std::wstring& filter, const std::filesystem::path& initialFolder, const std::wstring& defaultFileName, const wchar_t* defaultExt) {
     std::vector<WCHAR> buf(32768, L'\0');
     if (defaultFileName.size() >= buf.size())
         return std::nullopt;
@@ -1178,23 +1315,35 @@ static bool SaveCurrentDocument() {
             std::wstring msg =
                 L"読み込み後にプロジェクトファイルが外部で更新されています。\n\n  " +
                 g_doc.sourcePath.wstring() +
-                L"\n\nこのまま保存すると、外部で更新された内容を上書きする可能性があ"
-                L"ります。\n"
+                L"\n\n"
+                L"このまま保存すると、外部で更新された内容を上書きする可能性があります。\n"
                 L"保存を続行しますか？";
-            if (TaskMsgBox(g_hWnd, msg.c_str(), L"外部更新の検出",
-                           MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+            if (TaskMsgBox(g_hWnd, msg.c_str(), L"外部更新の検出", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
                 return false;
-            }
         }
     }
+
+    RunningAviUtl2Match aviutlMatch;
+    if (FindPossibleAviUtl2Window(g_doc.sourcePath, &aviutlMatch)) {
+        std::wstring msg = std::wstring(L"AviUtl2でこのプロジェクトが開かれているようです。\n\n") +
+                           L"  検出したウィンドウ: " +
+                           aviutlMatch.windowTitle +
+                           L"\n\n"
+                           L"このまま保存すると、AviUtl2側の保存によって変更が上書きされたり、\n"
+                           L"AviUtl2の表示と内容が食い違ったりする可能性があります。\n"
+                           L"※ウィンドウタイトルからの簡易判定のため、誤検出・見逃しの可能性があります。\n"
+                           L"保存を続行しますか？";
+        if (TaskMsgBox(g_hWnd, msg, L"AviUtl2で開いている可能性の検出", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+            return false;
+    }
+
     if (!SaveAup2(g_doc, g_doc.sourcePath)) {
         TaskMsgBox(g_hWnd, L"保存に失敗しました。", L"エラー", MB_ICONERROR);
         return false;
     }
 
     SetDirty(false);
-    TaskMsgBox(g_hWnd, L"保存しました。(バックアップ: .aup2.bak)", L"完了",
-               MB_ICONINFORMATION);
+    TaskMsgBox(g_hWnd, L"保存しました。(バックアップ: .aup2.bak)", L"完了", MB_ICONINFORMATION);
     return true;
 }
 
@@ -1202,8 +1351,7 @@ static bool ConfirmSaveIfDirty() {
     if (!g_loaded || !g_dirty)
         return true;
 
-    int32_t result = TaskMsgBox(g_hWnd, L"未保存の変更があります。保存しますか？",
-                                L"確認", MB_YESNOCANCEL | MB_ICONWARNING);
+    int32_t result = TaskMsgBox(g_hWnd, L"未保存の変更があります。保存しますか？", L"確認", MB_YESNOCANCEL | MB_ICONWARNING);
     if (result == IDCANCEL)
         return false;
     if (result == IDYES)
@@ -1289,8 +1437,7 @@ static void ListViewPopulate() {
 static void OpenFile(const std::filesystem::path& path) {
     auto result = ParseAup2(path);
     if (!result) {
-        TaskMsgBox(g_hWnd, L"ファイルの読み込みに失敗しました。", L"エラー",
-                   MB_ICONERROR);
+        TaskMsgBox(g_hWnd, L"ファイルの読み込みに失敗しました。", L"エラー", MB_ICONERROR);
         return;
     }
     g_doc = std::move(*result);
@@ -1309,12 +1456,23 @@ static void OpenFile(const std::filesystem::path& path) {
                              L"  記録: ") +
                 ToWide(entry.path) + L"\n  実際: " + g_doc.sourcePath.wstring() +
                 L"\n\n保存時に現在のパスで上書きしますか？";
-            if (TaskMsgBox(g_hWnd, msg.c_str(), L"パスの不一致",
-                           MB_YESNO | MB_ICONWARNING) == IDYES) {
+            if (TaskMsgBox(g_hWnd, msg.c_str(), L"パスの不一致", MB_YESNO | MB_ICONWARNING) == IDYES)
                 entry.path = ToUtf8(g_doc.sourcePath.wstring());
-            }
         }
         break;
+    }
+
+    RunningAviUtl2Match aviutlMatch;
+    if (FindPossibleAviUtl2Window(g_doc.sourcePath, &aviutlMatch)) {
+        TaskMsgBox(g_hWnd,
+                   std::wstring(L"このプロジェクトはAviUtl2で開かれているようです。\n\n") +
+                       L"  検出したウィンドウ: " +
+                       aviutlMatch.windowTitle +
+                       L"\n\n"
+                       L"AviUtl2側で保存すると、ここでの変更が上書きされることがあります。\n"
+                       L"編集内容を保存する前にAviUtl2を閉じることをおすすめします。\n"
+                       L"※ウィンドウタイトルからの簡易判定のため、誤検出・見逃しの可能性があります。",
+                   L"AviUtl2で開いている可能性の検出", MB_ICONWARNING);
     }
 
     ListViewPopulate();
@@ -1359,8 +1517,7 @@ static void OnBtnEditSel() {
     std::vector<WCHAR> buf(32768, L'\0');
     std::wstring initialPath = ToWide(oldPath);
     if (initialPath.size() >= buf.size()) {
-        TaskMsgBox(g_hWnd, L"初期パスが長すぎるため開けません。", L"エラー",
-                   MB_ICONERROR);
+        TaskMsgBox(g_hWnd, L"初期パスが長すぎるため開けません。", L"エラー", MB_ICONERROR);
         return;
     }
     wcscpy_s(buf.data(), buf.size(), initialPath.c_str());
@@ -1394,8 +1551,7 @@ static void OnBtnEditSel() {
                         L"まとめて変更しますか？\n\n"
                         L"  元: {}\n  新: {}",
                         sameIndices.size(), ToWide(oldPath), ToWide(newPath));
-        updateAll = (TaskMsgBox(g_hWnd, msg.c_str(), L"一括変更の確認",
-                                MB_YESNO | MB_ICONQUESTION) == IDYES);
+        updateAll = (TaskMsgBox(g_hWnd, msg.c_str(), L"一括変更の確認", MB_YESNO | MB_ICONQUESTION) == IDYES);
     }
 
     if (newPath == oldPath)
@@ -1414,8 +1570,7 @@ static void OnBtnEditSel() {
     ListViewPopulate();
 }
 
-static std::vector<DetectedRootMapping>
-DetectRootMappings(const std::filesystem::path& newRoot) {
+static std::vector<DetectedRootMapping> DetectRootMappings(const std::filesystem::path& newRoot) {
     std::vector<std::filesystem::path> sources;
     for (const auto& entry : g_doc.entries) {
         if (entry.isProjectFile)
@@ -1482,15 +1637,13 @@ DetectRootMappings(const std::filesystem::path& newRoot) {
 
 static void CommitSelectionDialog(HWND hWnd, SelectionDialogState* state) {
     if (state) {
-        int32_t sel =
-            static_cast<int32_t>(SendMessage(state->hList, LB_GETCURSEL, 0, 0));
+        int32_t sel = static_cast<int32_t>(SendMessage(state->hList, LB_GETCURSEL, 0, 0));
         state->result = (sel != LB_ERR) ? sel : -1;
     }
     DestroyWindow(hWnd);
 }
 
-static LRESULT CALLBACK SelectionDlgWndProc(HWND hWnd, UINT msg, WPARAM wp,
-                                            LPARAM lp) {
+static LRESULT CALLBACK SelectionDlgWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
     auto* state = reinterpret_cast<SelectionDialogState*>(
         GetWindowLongPtr(hWnd, GWLP_USERDATA));
 
@@ -1500,45 +1653,30 @@ static LRESULT CALLBACK SelectionDlgWndProc(HWND hWnd, UINT msg, WPARAM wp,
             state = reinterpret_cast<SelectionDialogState*>(cs->lpCreateParams);
             SetWindowLongPtr(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
             HINSTANCE hi = cs->hInstance;
-            std::wstring destLabel =
-                L"置換先: " + state->mappings->at(0).newRoot.wstring();
-            CreateWindow(L"STATIC", destLabel.c_str(),
-                         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, 8, 8, 684,
-                         18, hWnd, nullptr, hi, nullptr);
+            std::wstring destLabel = L"置換先: " + state->mappings->at(0).newRoot.wstring();
+            CreateWindow(L"STATIC", destLabel.c_str(), WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, 8, 8, 684, 18, hWnd, nullptr, hi, nullptr);
 
-            CreateWindow(L"STATIC", L"置換元として適用するフォルダを選択してください:",
-                         WS_CHILD | WS_VISIBLE | SS_LEFT, 8, 30, 684, 18, hWnd, nullptr,
-                         hi, nullptr);
-            state->hList = CreateWindow(
-                L"LISTBOX", L"",
-                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY, 8, 52, 684,
-                190, hWnd, reinterpret_cast<HMENU>(ID_SEL_LIST), hi, nullptr);
+            CreateWindow(L"STATIC", L"置換元として適用するフォルダを選択してください:", WS_CHILD | WS_VISIBLE | SS_LEFT, 8, 30, 684, 18, hWnd, nullptr, hi, nullptr);
+            state->hList = CreateWindow(L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY, 8, 52, 684, 190, hWnd, reinterpret_cast<HMENU>(ID_SEL_LIST), hi, nullptr);
 
             for (const auto& m : *state->mappings) {
-                std::wstring item = std::format(L"[{} / {} 件マッチ]  {}", m.matchCount,
-                                                m.totalEntries, m.oldRoot.wstring());
-                SendMessage(state->hList, LB_ADDSTRING, 0,
-                            reinterpret_cast<LPARAM>(item.c_str()));
+                std::wstring item = std::format(L"[{} / {} 件マッチ]  {}", m.matchCount, m.totalEntries, m.oldRoot.wstring());
+                SendMessage(state->hList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
             }
             SendMessage(state->hList, LB_SETCURSEL, 0, 0);
 
-            CreateWindow(L"BUTTON", L"適用", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                         8, 252, 88, 28, hWnd, reinterpret_cast<HMENU>(IDOK), hi,
-                         nullptr);
-            CreateWindow(L"BUTTON", L"キャンセル",
-                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 104, 252, 110, 28, hWnd,
-                         reinterpret_cast<HMENU>(IDCANCEL), hi, nullptr);
+            CreateWindow(L"BUTTON", L"適用", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 8, 252, 88, 28, hWnd, reinterpret_cast<HMENU>(IDOK), hi, nullptr);
+            CreateWindow(L"BUTTON", L"キャンセル", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 104, 252, 110, 28, hWnd, reinterpret_cast<HMENU>(IDCANCEL), hi, nullptr);
             return 0;
         }
 
         case WM_COMMAND:
-            if (LOWORD(wp) == IDOK) {
+            if (LOWORD(wp) == IDOK)
                 CommitSelectionDialog(hWnd, state);
-            } else if (LOWORD(wp) == IDCANCEL) {
+            else if (LOWORD(wp) == IDCANCEL)
                 DestroyWindow(hWnd);
-            } else if (LOWORD(wp) == ID_SEL_LIST && HIWORD(wp) == LBN_DBLCLK) {
+            else if (LOWORD(wp) == ID_SEL_LIST && HIWORD(wp) == LBN_DBLCLK)
                 CommitSelectionDialog(hWnd, state);
-            }
             return 0;
 
         case WM_CLOSE:
@@ -1551,8 +1689,7 @@ static LRESULT CALLBACK SelectionDlgWndProc(HWND hWnd, UINT msg, WPARAM wp,
     return DefWindowProc(hWnd, msg, wp, lp);
 }
 
-static int32_t
-ShowMappingSelectionDialog(const std::vector<DetectedRootMapping>& mappings) {
+static int32_t ShowMappingSelectionDialog(const std::vector<DetectedRootMapping>& mappings) {
     HINSTANCE hi = GetModuleHandle(nullptr);
 
     WNDCLASS wc{};
@@ -1566,9 +1703,7 @@ ShowMappingSelectionDialog(const std::vector<DetectedRootMapping>& mappings) {
     state.mappings = &mappings;
 
     HWND hDlg =
-        CreateWindow(L"aviutl2_relink_selDlg", L"置換元フォルダの選択",
-                     WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT,
-                     CW_USEDEFAULT, 720, 320, g_hWnd, nullptr, hi, &state);
+        CreateWindow(L"aviutl2_relink_selDlg", L"置換元フォルダの選択", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 720, 320, g_hWnd, nullptr, hi, &state);
 
     if (!hDlg)
         return -1;
@@ -1715,13 +1850,11 @@ static void OnBtnRelinkProjectFiles() {
         std::wstring msg =
             L"プロジェクト直下の素材フォルダが見つかりません。\n\n  " +
             currentRoot.wstring() + L"\n\n別のフォルダを指定しますか？";
-        if (TaskMsgBox(g_hWnd, msg.c_str(), L"直下素材へ再リンク",
-                       MB_YESNO | MB_ICONQUESTION) != IDYES) {
+        if (TaskMsgBox(g_hWnd, msg.c_str(), L"直下素材へ再リンク", MB_YESNO | MB_ICONQUESTION) != IDYES) {
             return;
         }
 
-        auto picked = PickFolder(L"現在の素材フォルダを選択してください",
-                                 g_doc.sourcePath.parent_path());
+        auto picked = PickFolder(L"現在の素材フォルダを選択してください", g_doc.sourcePath.parent_path());
         if (!picked)
             return;
         currentRoot = *picked;
@@ -1812,11 +1945,7 @@ static void OnBtnRelinkProjectFiles() {
     TaskMsgBox(g_hWnd, msg.c_str(), L"直下素材へ再リンク", MB_ICONINFORMATION);
 }
 
-static void StartCopyWorker(CopyPlan plan, bool copyAskItems,
-                            bool overwriteExisting, bool updatePaths,
-                            UpdatePathsMode exportLog,
-                            UpdatePathsMode exportResult,
-                            UpdatePathsMode saveAfterUpdate) {
+static void StartCopyWorker(CopyPlan plan, bool copyAskItems, bool overwriteExisting, bool updatePaths, UpdatePathsMode exportLog, UpdatePathsMode exportResult, UpdatePathsMode saveAfterUpdate) {
     g_copyInProgress = true;
     UpdateWindowTitle();
     UpdateControlStates();
@@ -1907,10 +2036,8 @@ static void StartCopyWorker(CopyPlan plan, bool copyAskItems,
             result->records.push_back(std::move(record));
         }
 
-        if (!PostMessage(g_hWnd, WM_COPYFILES_DONE, 0,
-                         reinterpret_cast<LPARAM>(result))) {
+        if (!PostMessage(g_hWnd, WM_COPYFILES_DONE, 0, reinterpret_cast<LPARAM>(result)))
             delete result;
-        }
     }).detach();
 }
 
@@ -1923,8 +2050,7 @@ static void FinishCopyFiles(CopyExecutionResult& result) {
         for (auto& entry : g_doc.entries) {
             if (entry.isProjectFile)
                 continue;
-            auto sourceKey =
-                ToLower(NormalizePathForCompare(PathFromUtf8(entry.path)).wstring());
+            auto sourceKey = ToLower(NormalizePathForCompare(PathFromUtf8(entry.path)).wstring());
             auto it = result.copiedPaths.find(sourceKey);
             if (it == result.copiedPaths.end())
                 continue;
@@ -1946,9 +2072,8 @@ static void FinishCopyFiles(CopyExecutionResult& result) {
                                           L"コピー先へ参照パスを変更しました。\n"
                                           L"このままプロジェクトを保存しますか？",
                                           L"素材コピー");
-        if (saveRequested) {
+        if (saveRequested)
             saved = SaveCurrentDocument();
-        }
     } else {
         UpdateWindowTitle();
         UpdateControlStates();
@@ -1961,12 +2086,9 @@ static void FinishCopyFiles(CopyExecutionResult& result) {
     std::vector<std::filesystem::path> exportedPaths;
     std::error_code ec;
     std::filesystem::create_directories(result.destRoot, ec);
-    std::wstring baseName =
-        g_doc.sourcePath.stem().wstring() + L"_copy_" + MakeTimestamp();
+    std::wstring baseName = g_doc.sourcePath.stem().wstring() + L"_copy_" + MakeTimestamp();
 
-    logRequested = ResolveAskSetting(result.exportLog,
-                                     L"コピー処理のログを .log で出力しますか？",
-                                     L"素材コピー");
+    logRequested = ResolveAskSetting(result.exportLog, L"コピー処理のログを .log で出力しますか？", L"素材コピー");
     if (logRequested) {
         auto logPath = result.destRoot / (baseName + L".log");
         logExported = WriteCopyLog(result, logPath, updated, saved);
@@ -1975,8 +2097,7 @@ static void FinishCopyFiles(CopyExecutionResult& result) {
     }
 
     resultRequested =
-        ResolveAskSetting(result.exportResult,
-                          L"コピー結果を .csv で出力しますか？", L"素材コピー");
+        ResolveAskSetting(result.exportResult, L"コピー結果を .csv で出力しますか？", L"素材コピー");
     if (resultRequested) {
         auto csvPath = result.destRoot / (baseName + L".csv");
         resultExported = WriteCopyResultCsv(result, csvPath);
@@ -2223,8 +2344,7 @@ static void FinishCheck(std::vector<CheckResult>* resultsPtr) {
         resultMsg += L"\n  ";
         resultMsg += exportPath->wstring();
     }
-    TaskMsgBox(g_hWnd, resultMsg, L"チェック結果",
-               (!exported || ng > 0) ? MB_ICONWARNING : MB_ICONINFORMATION);
+    TaskMsgBox(g_hWnd, resultMsg, L"チェック結果", (!exported || ng > 0) ? MB_ICONWARNING : MB_ICONINFORMATION);
 }
 
 static void OnBtnSave() {
@@ -2270,16 +2390,12 @@ static void OnSize(int32_t cx, int32_t cy) {
     int32_t y = MARGIN;
 
     MoveWindow(GetDlgItem(g_hWnd, ID_BTN_OPEN), MARGIN, y, BTN_W, BTN_H, TRUE);
-    MoveWindow(GetDlgItem(g_hWnd, ID_EDIT_FILEPATH), MARGIN + BTN_W + 4, y,
-               cx - MARGIN * 2 - BTN_W - 4, BTN_H, TRUE);
+    MoveWindow(GetDlgItem(g_hWnd, ID_EDIT_FILEPATH), MARGIN + BTN_W + 4, y, cx - MARGIN * 2 - BTN_W - 4, BTN_H, TRUE);
     y += ROW_H;
 
-    MoveWindow(GetDlgItem(g_hWnd, ID_STATIC_FILTER), MARGIN, y, FILTER_LABEL_W,
-               BTN_H, TRUE);
-    MoveWindow(GetDlgItem(g_hWnd, ID_EDIT_FILTER), MARGIN + FILTER_LABEL_W, y,
-               cx - MARGIN * 2 - FILTER_LABEL_W - NG_ONLY_W - 8, BTN_H, TRUE);
-    MoveWindow(GetDlgItem(g_hWnd, ID_CHECK_NGONLY), cx - MARGIN - NG_ONLY_W, y,
-               NG_ONLY_W, BTN_H, TRUE);
+    MoveWindow(GetDlgItem(g_hWnd, ID_STATIC_FILTER), MARGIN, y, FILTER_LABEL_W, BTN_H, TRUE);
+    MoveWindow(GetDlgItem(g_hWnd, ID_EDIT_FILTER), MARGIN + FILTER_LABEL_W, y, cx - MARGIN * 2 - FILTER_LABEL_W - NG_ONLY_W - 8, BTN_H, TRUE);
+    MoveWindow(GetDlgItem(g_hWnd, ID_CHECK_NGONLY), cx - MARGIN - NG_ONLY_W, y, NG_ONLY_W, BTN_H, TRUE);
     y += ROW_H;
 
     int32_t listH = cy - y - BOTTOM - MARGIN;
@@ -2287,24 +2403,12 @@ static void OnSize(int32_t cx, int32_t cy) {
     y += listH + 4;
 
     MoveWindow(GetDlgItem(g_hWnd, ID_BTN_CHECK), MARGIN, y, BTN_W, BTN_H, TRUE);
-    MoveWindow(GetDlgItem(g_hWnd, ID_BTN_CHECKEXPORT), MARGIN + BTN_W + 4, y,
-               CHECK_EXPORT_BTN_W, BTN_H, TRUE);
-    MoveWindow(GetDlgItem(g_hWnd, ID_BTN_EDITSEL),
-               MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4, y, MID_BTN_W, BTN_H,
-               TRUE);
-    MoveWindow(GetDlgItem(g_hWnd, ID_BTN_REPLACEROOT),
-               MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4 + MID_BTN_W + 4, y,
-               MID_BTN_W, BTN_H, TRUE);
-    MoveWindow(GetDlgItem(g_hWnd, ID_BTN_RELINK_PROJECT_FILES),
-               MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4 + MID_BTN_W + 4 +
-                   MID_BTN_W + 4,
-               y, RELINK_BTN_W, BTN_H, TRUE);
-    MoveWindow(GetDlgItem(g_hWnd, ID_BTN_COPYFILES),
-               MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4 + MID_BTN_W + 4 +
-                   MID_BTN_W + 4 + RELINK_BTN_W + 4,
-               y, COPY_BTN_W, BTN_H, TRUE);
-    MoveWindow(GetDlgItem(g_hWnd, ID_BTN_SAVE), cx - MARGIN - BTN_W, y, BTN_W,
-               BTN_H, TRUE);
+    MoveWindow(GetDlgItem(g_hWnd, ID_BTN_CHECKEXPORT), MARGIN + BTN_W + 4, y, CHECK_EXPORT_BTN_W, BTN_H, TRUE);
+    MoveWindow(GetDlgItem(g_hWnd, ID_BTN_EDITSEL), MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4, y, MID_BTN_W, BTN_H, TRUE);
+    MoveWindow(GetDlgItem(g_hWnd, ID_BTN_REPLACEROOT), MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4 + MID_BTN_W + 4, y, MID_BTN_W, BTN_H, TRUE);
+    MoveWindow(GetDlgItem(g_hWnd, ID_BTN_RELINK_PROJECT_FILES), MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4 + MID_BTN_W + 4 + MID_BTN_W + 4, y, RELINK_BTN_W, BTN_H, TRUE);
+    MoveWindow(GetDlgItem(g_hWnd, ID_BTN_COPYFILES), MARGIN + BTN_W + 4 + CHECK_EXPORT_BTN_W + 4 + MID_BTN_W + 4 + MID_BTN_W + 4 + RELINK_BTN_W + 4, y, COPY_BTN_W, BTN_H, TRUE);
+    MoveWindow(GetDlgItem(g_hWnd, ID_BTN_SAVE), cx - MARGIN - BTN_W, y, BTN_W, BTN_H, TRUE);
 }
 
 static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
@@ -2316,29 +2420,15 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
                 g_dpi = GetDpiForWindow(hWnd);
                 g_hFont = CreateUiFont(g_dpi);
 
-                CreateWindow(L"BUTTON", L"開く", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0,
-                             0, 0, 0, hWnd, ControlId(ID_BTN_OPEN), hi, nullptr);
-                CreateWindow(L"EDIT", L"",
-                             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_READONLY |
-                                 ES_AUTOHSCROLL,
-                             0, 0, 0, 0, hWnd, ControlId(ID_EDIT_FILEPATH), hi, nullptr);
-                CreateWindow(L"STATIC", L"絞り込み",
-                             WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, 0, 0, 0, 0, hWnd,
-                             ControlId(ID_STATIC_FILTER), hi, nullptr);
-                CreateWindow(L"EDIT", L"",
-                             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0,
-                             0, hWnd, ControlId(ID_EDIT_FILTER), hi, nullptr);
-                CreateWindow(L"BUTTON", L"NGのみ",
-                             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, hWnd,
-                             ControlId(ID_CHECK_NGONLY), hi, nullptr);
+                CreateWindow(L"BUTTON", L"開く", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd, ControlId(ID_BTN_OPEN), hi, nullptr);
+                CreateWindow(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_READONLY | ES_AUTOHSCROLL, 0, 0, 0, 0, hWnd, ControlId(ID_EDIT_FILEPATH), hi, nullptr);
+                CreateWindow(L"STATIC", L"絞り込み", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, 0, 0, 0, 0, hWnd, ControlId(ID_STATIC_FILTER), hi, nullptr);
+                CreateWindow(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, hWnd, ControlId(ID_EDIT_FILTER), hi, nullptr);
+                CreateWindow(L"BUTTON", L"NGのみ", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, hWnd, ControlId(ID_CHECK_NGONLY), hi, nullptr);
 
-                g_hList = CreateWindow(WC_LISTVIEW, L"",
-                                       WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT |
-                                           LVS_SHOWSELALWAYS,
-                                       0, 0, 0, 0, hWnd, ControlId(ID_LIST), hi, nullptr);
+                g_hList = CreateWindow(WC_LISTVIEW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SHOWSELALWAYS, 0, 0, 0, 0, hWnd, ControlId(ID_LIST), hi, nullptr);
                 SetWindowTheme(g_hList, L"Explorer", nullptr);
-                ListView_SetExtendedListViewStyle(g_hList, LVS_EX_FULLROWSELECT |
-                                                               LVS_EX_GRIDLINES);
+                ListView_SetExtendedListViewStyle(g_hList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
 
                 LVCOLUMN lvc{};
                 lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
@@ -2371,26 +2461,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
                 lvc.cx = ScaleForDpi(360, g_dpi);
                 ListView_InsertColumn(g_hList, COL_PATH, &lvc);
 
-                CreateWindow(L"BUTTON", L"チェック",
-                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
-                             ControlId(ID_BTN_CHECK), hi, nullptr);
-                CreateWindow(L"BUTTON", L"チェック結果出力",
-                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
-                             ControlId(ID_BTN_CHECKEXPORT), hi, nullptr);
-                CreateWindow(L"BUTTON", L"選択行を変更",
-                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
-                             ControlId(ID_BTN_EDITSEL), hi, nullptr);
-                CreateWindow(L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0,
-                             0, 0, 0, hWnd, ControlId(ID_BTN_SAVE), hi, nullptr);
-                CreateWindow(L"BUTTON", L"ルート一括置換",
-                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
-                             ControlId(ID_BTN_REPLACEROOT), hi, nullptr);
-                CreateWindow(L"BUTTON", L"直下素材へ再リンク",
-                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
-                             ControlId(ID_BTN_RELINK_PROJECT_FILES), hi, nullptr);
-                CreateWindow(L"BUTTON", L"素材をコピー",
-                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd,
-                             ControlId(ID_BTN_COPYFILES), hi, nullptr);
+                CreateWindow(L"BUTTON", L"チェック", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd, ControlId(ID_BTN_CHECK), hi, nullptr);
+                CreateWindow(L"BUTTON", L"チェック結果出力", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd, ControlId(ID_BTN_CHECKEXPORT), hi, nullptr);
+                CreateWindow(L"BUTTON", L"選択行を変更", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd, ControlId(ID_BTN_EDITSEL), hi, nullptr);
+                CreateWindow(L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd, ControlId(ID_BTN_SAVE), hi, nullptr);
+                CreateWindow(L"BUTTON", L"ルート一括置換", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd, ControlId(ID_BTN_REPLACEROOT), hi, nullptr);
+                CreateWindow(L"BUTTON", L"直下素材へ再リンク", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd, ControlId(ID_BTN_RELINK_PROJECT_FILES), hi, nullptr);
+                CreateWindow(L"BUTTON", L"素材をコピー", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWnd, ControlId(ID_BTN_COPYFILES), hi, nullptr);
 
                 ApplyFontToChildren();
                 DragAcceptFiles(hWnd, TRUE);
@@ -2462,6 +2539,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
                 }
                 return 0;
 
+            case WM_CONTEXTMENU: {
+                if (reinterpret_cast<HWND>(wp) == g_hList) {
+                    const int32_t x = static_cast<int32_t>(static_cast<int16_t>(LOWORD(lp)));
+                    const int32_t y = static_cast<int32_t>(static_cast<int16_t>(HIWORD(lp)));
+                    ShowListContextMenu(hWnd, x, y);
+                    return 0;
+                }
+                break;
+            }
+
             case WM_COPYFILES_DONE: {
                 std::unique_ptr<CopyExecutionResult> result(reinterpret_cast<CopyExecutionResult*>(lp));
                 if (result)
@@ -2512,14 +2599,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, uint32_t msg, WPARAM wp, LPARAM lp) {
         MessageBoxA(hWnd, e.what(), "予期しないエラー", MB_ICONERROR);
         return 0;
     } catch (...) {
-        TaskMsgBox(hWnd, L"予期しないエラーが発生しました。", L"エラー",
-                   MB_ICONERROR);
+        TaskMsgBox(hWnd, L"予期しないエラーが発生しました。", L"エラー", MB_ICONERROR);
         return 0;
     }
 }
 
-int32_t WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine,
-                        int32_t nCmdShow) {
+int32_t WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int32_t nCmdShow) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_LISTVIEW_CLASSES };
@@ -2538,10 +2623,7 @@ int32_t WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine,
     int32_t initialWidth = MulDiv(900, startupDpi, USER_DEFAULT_SCREEN_DPI);
     int32_t initialHeight = MulDiv(600, startupDpi, USER_DEFAULT_SCREEN_DPI);
 
-    HWND hWnd = CreateWindow(L"aviutl2_relink", APP_TITLE_BASE,
-                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                             initialWidth, initialHeight, nullptr, nullptr,
-                             hInstance, nullptr);
+    HWND hWnd = CreateWindow(L"aviutl2_relink", APP_TITLE_BASE, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, initialWidth, initialHeight, nullptr, nullptr, hInstance, nullptr);
 
     ShowWindow(hWnd, nCmdShow);
     UpdateWindow(hWnd);

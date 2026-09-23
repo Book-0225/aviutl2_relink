@@ -66,9 +66,8 @@ std::optional<Aup2Document> ParseAup2(const std::filesystem::path& path) {
     {
         unsigned char bom[3]{};
         ifs.read(reinterpret_cast<char*>(bom), 3);
-        if (!(bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF)) {
+        if (!(bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF))
             ifs.seekg(0);
-        }
     }
 
     Aup2Document doc;
@@ -151,9 +150,8 @@ std::optional<Aup2Document> ParseAup2(const std::filesystem::path& path) {
         entry.path = value;
         entry.isProjectFile = inProjectSection && (key == "file" || key == "File");
 
-        if (entry.isProjectFile) {
+        if (entry.isProjectFile)
             doc.projectFileLineno = lineno;
-        }
 
         doc.entries.push_back(std::move(entry));
     }
