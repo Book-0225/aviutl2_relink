@@ -29,6 +29,11 @@ AviUtl ExEdit2 のプロジェクトファイル (.aup2) が参照している�
 - Visual C++ 再頒布可能パッケージ（v14 の x64 対応版が必要）
   - <https://learn.microsoft.com/ja-jp/cpp/windows/latest-supported-vc-redist>
 
+- AviUtl ExEdit2 version2.1.10以降(2.1.10で動作確認をしています)
+  - <https://spring-fragrance.mints.ne.jp/aviutl>
+  - バージョンアップによって仕様が変更された場合動作しない可能性があります。
+  - ランチャーを利用しない場合必要ありません。
+
 ## 使い方
 
 1. `aviutl2_relink.exe` を起動します  
@@ -48,6 +53,10 @@ CSVには、各参照ファイルの `status`、`key`、`path`、`is_project_fil
 
 絞り込み欄に文字を入力すると、キーまたはパスに一致する行だけを表示できます。  
 「NGのみ」を有効にすると、存在チェック後に見つからなかった参照だけを表示できます。
+
+### ファイルの確認
+
+ファイルを右クリックすると`エクスプローラーで表示`, `パスをコピー`, `ファイルを開く`が表示されます。
 
 ### パスの変更
 
@@ -282,6 +291,11 @@ CSVには、各参照ファイルの `result`、`action`、`source`、`destinati
 
 ## 改版履歴
 
+- **v0.0.9**
+  - 右クリックメニューを追加([#1](https://github.com/Book-0225/aviutl2_relink/issues/1))
+  - ランチャーに`現在のプロジェクトを上書きして開く`を追加
+  - 動作に必要なAviUtl ExEdit2のバージョンをversion2.1.10以降に変更
+
 - **v0.0.8**
   - 見れる情報を追加
   - .objectファイルに対応
@@ -340,12 +354,14 @@ CSVには、各参照ファイルの `result`、`action`、`source`、`destinati
 msbuild aviutl2_relink_launcher.vcxproj /p:Configuration=Release /p:Platform="x64"
 ```
 
-`aviutl2_relink_launcher.aux2` と `aviutl2_relink.exe` を同じフォルダに配置してください。
-AviUtl2 側で未保存の変更がある場合、外部ツールには最後に保存した `.aup2` の内容だけが表示されます。
+`aviutl2_relink_launcher.aux2` と `aviutl2_relink.exe` を同じフォルダに配置してください。  
+AviUtl2 側で未保存の変更がある場合、外部ツールには最後に保存した `.aup2` の内容だけが表示されます。  
+v0.0.9以降では`現在のプロジェクトを上書きして開く`実行時に自動で保存を試みます。
 
 編集メニューには以下が追加されます。
 
 - `aviutl2_relink > 現在のプロジェクトを開く`
+- `aviutl2_relink > 現在のプロジェクトを上書きして開く`
 - `aviutl2_relink > aup2 を選んで開く`
 - `aviutl2_relink > ツールだけ起動`
 
