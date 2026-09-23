@@ -1,6 +1,7 @@
 ﻿#define WIN32_LEAN_AND_MEAN
 // clang-format off
 #include <windows.h>
+#include <stdint.h>
 // clang-format on
 #include "plugin2.h"
 
