@@ -15,10 +15,9 @@
 namespace {
 
 constexpr wchar_t PLUGIN_NAME[] = L"aviutl2_relink launcher";
-constexpr wchar_t PLUGIN_INFORMATION[] =
-    L"aviutl2_relink launcher v0.0.8 by BOOK25";
-constexpr wchar_t MENU_OPEN_CURRENT[] =
-    L"aviutl2_relink\\現在のプロジェクトを開く";
+constexpr wchar_t PLUGIN_INFORMATION[] = L"aviutl2_relink launcher v0.0.9 by BOOK25";
+constexpr wchar_t MENU_OPEN_CURRENT[] = L"aviutl2_relink\\現在のプロジェクトを開く";
+constexpr wchar_t MENU_OPEN_CURRENT_AND_SAVE[] = L"aviutl2_relink\\現在のプロジェクトを上書きして開く";
 constexpr wchar_t MENU_PICK_PROJECT[] = L"aviutl2_relink\\aup2 を選んで開く";
 constexpr wchar_t MENU_OPEN_TOOL[] = L"aviutl2_relink\\ツールだけ起動";
 constexpr wchar_t EXE_NAME[] = L"aviutl2_relink.exe";
@@ -31,6 +30,12 @@ COMMON_PLUGIN_TABLE g_commonPluginTable = {
 HOST_APP_TABLE* g_host = nullptr;
 EDIT_HANDLE* g_editHandle = nullptr;
 
+std::filesystem::path g_pendingProjectPath;
+std::filesystem::path g_pendingExePath;
+bool g_pendingSave;
+
+constexpr UINT_PTR TIMER_ID = 96655;
+
 HWND OwnerWindow() {
     if (!g_editHandle || !g_editHandle->get_host_app_window)
         return nullptr;
@@ -39,17 +44,12 @@ HWND OwnerWindow() {
 
 std::filesystem::path ModuleDirectory() {
     HMODULE module = nullptr;
-    if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(&g_commonPluginTable),
-                           &module)) {
+    if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&g_commonPluginTable), &module))
         return std::filesystem::current_path();
-    }
 
     std::vector<wchar_t> buffer(MAX_PATH);
     for (;;) {
-        DWORD size = GetModuleFileName(module, buffer.data(),
-                                       static_cast<DWORD>(buffer.size()));
+        DWORD size = GetModuleFileName(module, buffer.data(), static_cast<DWORD>(buffer.size()));
         if (size == 0)
             return std::filesystem::current_path();
         if (size + 1 < buffer.size())
@@ -73,8 +73,7 @@ std::optional<std::filesystem::path> FindRelinkExe() {
     return std::nullopt;
 }
 
-std::optional<std::filesystem::path>
-PickProjectFile(HWND owner, const std::filesystem::path& initialFolder) {
+std::optional<std::filesystem::path> PickProjectFile(HWND owner, const std::filesystem::path& initialFolder) {
     std::vector<wchar_t> buffer(32768, L'\0');
 
     OPENFILENAMEW ofn{};
@@ -117,8 +116,7 @@ std::wstring QuoteForCommandLine(const std::wstring& value) {
     return quoted;
 }
 
-bool LaunchRelink(const std::filesystem::path& exePath,
-                  const std::optional<std::filesystem::path>& projectPath) {
+bool LaunchRelink(const std::filesystem::path& exePath, const std::optional<std::filesystem::path>& projectPath) {
     std::wstring commandLine = QuoteForCommandLine(exePath.wstring());
     if (projectPath) {
         commandLine += L" ";
@@ -131,9 +129,7 @@ bool LaunchRelink(const std::filesystem::path& exePath,
     std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
     mutableCommand.push_back(L'\0');
 
-    BOOL ok = CreateProcess(
-        exePath.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE, 0,
-        nullptr, exePath.parent_path().c_str(), &startupInfo, &processInfo);
+    BOOL ok = CreateProcess(exePath.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE, 0, nullptr, exePath.parent_path().c_str(), &startupInfo, &processInfo);
     if (!ok)
         return false;
 
@@ -164,43 +160,56 @@ std::optional<std::filesystem::path> CurrentProjectPath(EDIT_SECTION* edit) {
     return std::filesystem::path(projectPathText);
 }
 
-void OpenCurrentProject(EDIT_SECTION* edit) {
+void CALLBACK TimerProc(HWND, UINT, UINT_PTR idEvent, DWORD) {
+    if (idEvent != TIMER_ID)
+        return;
+    HWND owner = OwnerWindow();
+    KillTimer(owner, TIMER_ID);
+    int32_t answer = MessageBox(
+        owner,
+        L"aviutl2_relink.exeで現在のプロジェクトファイルを開きます。\n\n"
+        L"AviUtl2側に未保存の変更がある場合、外部ツールには最後に保存した内容だけが表示されます。\n"
+        L"外部ツールで保存したあと、AviUtl2側で上書き保存すると変更が戻ることがあります。",
+        PLUGIN_NAME, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    if (answer != IDYES)
+        return;
+    if (g_pendingSave)
+        g_editHandle->save_project_file(g_pendingProjectPath.c_str());
+    if (!LaunchRelink(g_pendingExePath, g_pendingProjectPath))
+        MessageBox(owner, L"aviutl2_relink.exe の起動に失敗しました。", PLUGIN_NAME, MB_ICONERROR);
+}
+
+void OpenCurrentProject(EDIT_SECTION* edit, bool save) {
     HWND owner = OwnerWindow();
     auto projectPath = CurrentProjectPath(edit);
-    if (!projectPath) {
-        MessageBox(owner, L"プロジェクトファイルを取得できませんでした。",
-                   PLUGIN_NAME, MB_ICONERROR);
+    if (!projectPath.has_value()) {
+        MessageBox(owner, L"プロジェクトファイルを取得できませんでした。", PLUGIN_NAME, MB_ICONERROR);
         return;
     }
 
     auto exePath = FindRelinkExe();
-    if (!exePath) {
+    if (!exePath.has_value()) {
         ShowExeNotFound(owner);
         return;
     }
+    g_pendingProjectPath = *projectPath;
+    g_pendingExePath = *exePath;
+    g_pendingSave = save;
+    SetTimer(owner, TIMER_ID, 50, TimerProc);
+}
 
-    int answer = MessageBox(
-        owner,
-        L"aviutl2_relink.exe で現在のプロジェクトファイルを開きます。\n\n"
-        L"AviUtl2 "
-        L"側に未保存の変更がある場合、外部ツールには最後に保存した内容だけが表示"
-        L"されます。\n"
-        L"外部ツールで保存したあと、AviUtl2 "
-        L"側で上書き保存すると変更が戻ることがあります。",
-        PLUGIN_NAME, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
-    if (answer != IDYES)
-        return;
+void OpenCurrentProjectNotSave(EDIT_SECTION* edit) {
+    OpenCurrentProject(edit, false);
+}
 
-    if (!LaunchRelink(*exePath, projectPath)) {
-        MessageBox(owner, L"aviutl2_relink.exe の起動に失敗しました。",
-                   PLUGIN_NAME, MB_ICONERROR);
-    }
+void OpenCurrentProjectAndSave(EDIT_SECTION* edit) {
+    OpenCurrentProject(edit, true);
 }
 
 void PickAndOpenProject(EDIT_SECTION* edit) {
     HWND owner = OwnerWindow();
     auto exePath = FindRelinkExe();
-    if (!exePath) {
+    if (!exePath.has_value()) {
         ShowExeNotFound(owner);
         return;
     }
@@ -213,29 +222,25 @@ void PickAndOpenProject(EDIT_SECTION* edit) {
     if (!picked)
         return;
 
-    if (!LaunchRelink(*exePath, picked)) {
-        MessageBox(owner, L"aviutl2_relink.exe の起動に失敗しました。",
-                   PLUGIN_NAME, MB_ICONERROR);
-    }
+    if (!LaunchRelink(*exePath, picked))
+        MessageBox(owner, L"aviutl2_relink.exe の起動に失敗しました。", PLUGIN_NAME, MB_ICONERROR);
 }
 
 void OpenToolOnly(EDIT_SECTION*) {
     HWND owner = OwnerWindow();
     auto exePath = FindRelinkExe();
-    if (!exePath) {
+    if (!exePath.has_value()) {
         ShowExeNotFound(owner);
         return;
     }
 
-    if (!LaunchRelink(*exePath, std::nullopt)) {
-        MessageBox(owner, L"aviutl2_relink.exe の起動に失敗しました。",
-                   PLUGIN_NAME, MB_ICONERROR);
-    }
+    if (!LaunchRelink(*exePath, std::nullopt))
+        MessageBox(owner, L"aviutl2_relink.exe の起動に失敗しました。", PLUGIN_NAME, MB_ICONERROR);
 }
 } // namespace
 
 EXTERN_C __declspec(dllexport) DWORD RequiredVersion() {
-    return 2005301;
+    return 2011000;
 }
 
 EXTERN_C __declspec(dllexport) COMMON_PLUGIN_TABLE* GetCommonPluginTable() {
@@ -254,7 +259,8 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
         return;
 
     g_editHandle = g_host->create_edit_handle();
-    g_host->register_edit_menu(MENU_OPEN_CURRENT, OpenCurrentProject);
+    g_host->register_edit_menu(MENU_OPEN_CURRENT, OpenCurrentProjectNotSave);
+    g_host->register_edit_menu(MENU_OPEN_CURRENT_AND_SAVE, OpenCurrentProjectAndSave);
     g_host->register_edit_menu(MENU_PICK_PROJECT, PickAndOpenProject);
     g_host->register_edit_menu(MENU_OPEN_TOOL, OpenToolOnly);
 }
